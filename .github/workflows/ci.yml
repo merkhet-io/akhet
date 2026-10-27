@@ -1,0 +1,53 @@
+name: Rust CI
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: fmt, clippy, tests (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      # Unit tests plus loopback protocol integration: embedded rumqttd broker,
+      # tokio-modbus TCP server, akhet HTTP receiver, TLS proxy, crash faults.
+      - run: cargo test --locked
+
+  msrv:
+    name: tests (MSRV 1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  mosquitto:
+    name: redelivery against Mosquitto
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start Mosquitto 2 (loopback, anonymous, test only)
+        run: |
+          mkdir -p "$RUNNER_TEMP/mosquitto"
+          printf 'listener 1883\nallow_anonymous true\npersistence false\nmax_inflight_messages 20\n' > "$RUNNER_TEMP/mosquitto/mosquitto.conf"
+          docker run -d --name mosquitto -p 127.0.0.1:1883:1883 \
+            -v "$RUNNER_TEMP/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" \
+            eclipse-mosquitto:2
+          for i in $(seq 1 50); do nc -z 127.0.0.1 1883 && break; sleep 0.2; done
+      - run: cargo test --locked --test mqtt_external -- --ignored
+        env:
+          AKHET_TEST_BROKER_PORT: "1883"
+      - if: always()
+        run: docker logs mosquitto | tail -50
