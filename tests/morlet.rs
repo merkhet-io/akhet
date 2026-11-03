@@ -304,6 +304,8 @@ fn replays_bit_exact_with_gaps_duplicates_and_context() {
         );
     }
 
+    assert_searchable(&coll);
+
     // Nothing left: a second run writes nothing and changes nothing.
     let out = morlet_run(&spool, &cfg, &sink, &coll, None);
     assert!(out.status.success());
@@ -336,6 +338,72 @@ fn replays_bit_exact_with_gaps_duplicates_and_context() {
             .contains("morlet-test"),
         "no password"
     );
+}
+
+/// Default extractor (`auto`): every 40 kHz recording has
+/// `morlet-energy-v1` feature segments, and a window cut from a recording
+/// finds itself at distance 0 by feature search.
+fn assert_searchable(coll: &str) {
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let rows = db
+        .query(
+            &format!(
+                "SELECT r.recording_id, s.extractor_version, s.indexed_segments, s.received_samples
+                 FROM {coll} r, morlet_stream_status($1::text::regclass, r.recording_id) s"
+            ),
+            &[&coll],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    for r in &rows {
+        let (id, ext, segs, n): (String, String, i64, i64) =
+            (r.get(0), r.get(1), r.get(2), r.get(3));
+        assert_eq!(ext, "morlet-energy-v1", "{id}");
+        // window 512, stride 256
+        assert_eq!(segs, (n - 512) / 256 + 1, "{id}: segments for {n} samples");
+        let hit = db
+            .query_one(
+                "SELECT recording_id, start_sample, end_sample, distance
+                 FROM morlet_search_interval($1::text::regclass, $2, 256, 768, '{}', 1, exclude_source => false)",
+                &[&coll, &id],
+            )
+            .unwrap();
+        let (hid, hs, he, d): (String, i64, i64, f64) =
+            (hit.get(0), hit.get(1), hit.get(2), hit.get(3));
+        assert_eq!((hid.as_str(), hs, he, d), (id.as_str(), 256, 768, 0.0));
+    }
+}
+
+#[test]
+#[ignore = "needs AKHET_TEST_MORLET_URL"]
+fn extractor_none_stores_raw_samples_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("s.sqlite");
+    let want = build_spool(&spool);
+    let cfg = decoder_file(dir.path());
+    let coll = unique("akhet_raw");
+    let out = morlet_run_args(
+        &spool,
+        &cfg,
+        &unique("s"),
+        &coll,
+        None,
+        &["--extractor", "none"],
+    );
+    assert!(out.status.success());
+    assert_exact(&coll, &want);
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let row = db
+        .query_one(
+            &format!(
+                "SELECT count(*), sum(s.indexed_segments)::bigint, bool_and(s.extractor_version = 'none')
+                 FROM {coll} r, morlet_stream_status($1::text::regclass, r.recording_id) s"
+            ),
+            &[&coll],
+        )
+        .unwrap();
+    let (n, segs, none): (i64, i64, bool) = (row.get(0), row.get(1), row.get(2));
+    assert_eq!((n, segs, none), (4, 0, true));
 }
 
 #[test]
@@ -371,6 +439,7 @@ fn crashes_lose_and_duplicate_nothing() {
         assert!(crashes >= 5, "{fault}: only {crashes} crashes");
         assert_exact(&coll, &want);
         assert_eq!(context_rows(&coll).len(), 6, "{fault}");
+        assert_searchable(&coll);
         eprintln!("{fault}: {crashes} crashes, exact");
     }
 }

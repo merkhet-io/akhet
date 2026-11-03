@@ -131,3 +131,50 @@ separately.
   network.
 - Loopback HTTP and MQTT hide network latency; over a WAN, batched replay
   should gain more, single POSTs less.
+
+## MorletDB sink
+
+Replay of a spool into pg_morlet with `akhet morlet`'s code path
+(`akhet::morlet::run`), measured with `examples/morlet_sink.rs`:
+
+```sh
+ci/morletdb-test.sh /tmp/akhet-pgcerts      # disposable MorletDB on 127.0.0.1:54339
+AKHET_MORLET_URL=postgresql://morlet:morlet-test@127.0.0.1:54339/morlet \
+  cargo run --release --locked --example morlet_sink -- \
+  --channels 8 --rate 25600 --samples 256 --messages 400 --extractor auto
+```
+
+The example builds a spool in a temporary directory (one MQTT record per
+message and source, one group with `--channels` signals of `--samples`
+integer-valued samples at `--rate`, nanosecond timestamps). It then replays
+the spool into a fresh collection and prints samples/s, chunks/s,
+transactions, mean transaction time, mean chunk size and the size of the sink
+state row after the run. Defaults: `--records-per-tx 100`, window 512,
+stride 256, `zscore`.
+
+Setup: same machine as above. MorletDB `ghcr.io/merkhet-io/morletdb:0.3.3-alpha.1`
+(PostgreSQL 17.6, pg_morlet SQL 0.3.2, `fsync` and `synchronous_commit` on)
+in Docker Desktop 29.1.3 (Linux VM: 12 CPUs, 31 GiB), reached over the
+VM's loopback port forwarding, where a trivial query takes about 0.7 ms.
+Three runs per row, median, 2026-11-03.
+
+### Feature extraction (#23)
+
+| shape | extractor | samples | chunks | samples/s | chunks/s | ms per transaction |
+|---|---|---|---|---|---|---|
+| 8 ch × 25.6 kHz, 256 samples/message, 400 messages | `none` | 819 200 | 3 200 | 100 965 | 394 | 2 028 |
+| 8 ch × 25.6 kHz, 256 samples/message, 400 messages | `auto` (`morlet-energy-v1`) | 819 200 | 3 200 | 71 465 | 279 | 2 866 |
+| 4 ch × 100 Hz, 10 samples/message, 2 000 messages | `none` | 80 000 | 8 000 | 4 121 | 412 | 971 |
+| 4 ch × 100 Hz, 10 samples/message, 2 000 messages | `auto` (`morlet-energy-lowrate-v1`) | 80 000 | 8 000 | 3 619 | 362 | 1 105 |
+
+- Extraction at ingest cost about 29% of sink throughput at 25.6 kHz and
+  about 12% at 100 Hz on pg_morlet 0.3.3-alpha.1.
+- Both shapes are bound by per-chunk cost: the sink writes one chunk per
+  channel and message (mean chunk = samples per message), about 2.5 ms per
+  chunk including its evidence row. At 8 × 25.6 kHz the source produces
+  204 800 samples/s, about twice what the sink sustains here. Chunk
+  coalescing is tracked in #26.
+- The sink state row was 2.0 MB as text (0.55 MB stored) for 8 channels and
+  1.0 MB for 4 channels, mostly the duplicate-detection window
+  (`dedup_window_samples`, 8192 timestamp/value pairs per channel). It is
+  rewritten on every transaction; see #28.

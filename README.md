@@ -266,6 +266,23 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
   estimated, the tolerance and the discontinuity that started it. Chunks go
   through `morlet_append_chunk` at the grid's sample offsets; values are sent
   as binary float64 and read back bit-exactly.
+- **Feature extraction:** on by default, so recordings are searchable by
+  features (`morlet_search_interval`, `morlet_search_streams`). With
+  `--extractor auto` (the default) each new recording gets pg_morlet's
+  extractor for its rate: `morlet-energy-v1` for 128–200,000 Hz,
+  `morlet-energy-lowrate-v1` for 1–128 Hz, and `none` (raw samples only)
+  outside both. Window 512, stride 256 and `zscore` normalization unless set.
+  - `--extractor none` turns it off: raw samples only, no segment rows; such
+    recordings are skipped by feature search.
+  - Any other value is passed to MorletDB as the extractor version.
+  - The choice is fixed per recording when it is created. Changing the flag
+    affects new recordings only, so a running collection can mix raw-only and
+    searchable recordings.
+  - Extraction runs synchronously in the append, in the sink's transaction,
+    and so costs ingest time.
+  - Similarity search by envelopes (`morlet_search_similar`) is separate: it
+    needs `morlet_enable_envelopes` and `morlet_build_envelopes`, which the
+    sink does not run.
 - **Timing evidence:** per chunk in `akhet_morlet_evidence` (first/last
   original timestamp, max/RMS deviation, spool seq).
 - **Explicit issues:** decode, timing and context issues go to
@@ -319,9 +336,9 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
 Limits: one sink transaction holds `--records-per-tx`
 records; the stored state grows with the number of channels and
 `dedup_window_samples`, and is rewritten on every transaction. Two sinks must
-not write the same recordings. Feature extraction defaults to `none` (raw
-storage only); `--extractor`, `--window-size`, `--stride`, `--normalization`
-and `--sample-quantum` are passed to MorletDB for new recordings.
+not write the same recordings. `--window-size`, `--stride`,
+`--normalization` and `--sample-quantum` are passed to MorletDB for new
+recordings.
 
 ## Delivery semantics
 
@@ -860,6 +877,10 @@ JSON. Results, settings and hardware are in
 [docs/benchmarks.md](docs/benchmarks.md). They come from one development
 machine (macOS, `F_FULLFSYNC`); numbers for x86_64 and arm64 Linux edge
 hardware are still missing.
+
+`examples/morlet_sink.rs` measures the MorletDB sink (samples/s, chunks/s,
+time per transaction, sink state size) for a configurable payload shape
+against `AKHET_MORLET_URL`; see the MorletDB section of the same document.
 
 ## Scope boundaries
 
