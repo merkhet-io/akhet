@@ -302,10 +302,27 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
   `akhet_morlet_issues` (sink, spool seq, kind and details).
 - **Context:** for each context key of a source, the value in effect becomes
   an interval `[start_sample, end_sample)` on every recording of the same
-  source it overlaps (key = signal name). An interval is written once its end
-  is known: at the next change, or clipped at the end of a recording. The
-  value still in effect on an active recording is not written yet. Times map
-  to the first sample at or after the change.
+  source it overlaps (key = signal name). Times map to the first sample at or
+  after the change.
+  - **When rows appear:** an interval is written once its end is known: at
+    the next change of that key, or clipped at the end of a recording.
+  - **Lag:** the value currently in effect is therefore missing from the
+    collection's context timeline (`<collection>_ctx`) and from context
+    segments and comparisons. On an active recording it is absent for as
+    long as it stays in effect: the lag has no upper bound. A program that
+    runs for a whole shift appears only when the next program starts, or
+    when the recording ends (gap or discontinuity).
+  - **Why no open rows:** pg_morlet 0.3.3 has no open-ended interval that can
+    be extended. Revising the row on every transaction would add a revision
+    per key and recording each time, and mark segments stale. Closing and
+    reopening at chunk boundaries would split one program run into many
+    segments, and compare-to-history works per segment.
+  - **The value in effect now:** `akhet_morlet_context_current`, one row per
+    sink, source and key. It holds the value, `since_unix_ns` (source clock),
+    `collected_unix_ns` and the spool seq. It is updated in the same
+    transaction as the samples whenever a value changes. To find "now" in a
+    recording, map `since_unix_ns` to samples with the recording's anchor
+    and rate, or use the acquisition's time axis.
 - **Exactness:** derived state (grid state per channel, context timelines,
   written context offsets) lives in `akhet_morlet_sinks`. Each grid's
   duplicate-detection window lives in `akhet_morlet_recent`, as binary blocks

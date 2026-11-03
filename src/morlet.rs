@@ -431,6 +431,16 @@ CREATE TABLE IF NOT EXISTS akhet_morlet_recent(
   last_unix_ns bigint NOT NULL,
   placed bytea NOT NULL,
   PRIMARY KEY(sink, channel, first_unix_ns));
+CREATE TABLE IF NOT EXISTS akhet_morlet_context_current(
+  sink text NOT NULL,
+  collection text NOT NULL,
+  source text NOT NULL,
+  key text NOT NULL,
+  value jsonb NOT NULL,
+  since_unix_ns bigint NOT NULL,
+  collected_unix_ns bigint NOT NULL,
+  spool_seq bigint NOT NULL,
+  PRIMARY KEY(sink, source, key));
 CREATE TABLE IF NOT EXISTS akhet_morlet_issues(
   sink text NOT NULL,
   spool_seq bigint NOT NULL,
@@ -690,6 +700,9 @@ fn write_batch(
     let mut touched: Vec<String> = Vec::new();
     // Per recording: samples not yet sent (see PendingChunk).
     let mut pending: BTreeMap<String, PendingChunk> = BTreeMap::new();
+    // Per (source, key): the latest change in this transaction, for
+    // akhet_morlet_context_current.
+    let mut current: BTreeMap<(String, String), (Value, i64, i64, i64)> = BTreeMap::new();
     for rec in records {
         let ev =
             event::decode(&rec.body).map_err(|e| TxError::Fatal(ReplayError::Spool(e.into())))?;
@@ -851,6 +864,10 @@ fn write_batch(
             for o in outputs {
                 match o {
                     ContextOutput::Change(c) => {
+                        current.insert(
+                            (b.channel.source.clone(), b.channel.signal.clone()),
+                            (c.value.clone(), c.unix_ns, c.collected_unix_ns, rec.seq),
+                        );
                         let ivs = src.intervals.entry(b.channel.signal.clone()).or_default();
                         if let Some(open) = ivs.last_mut()
                             && open.end_ns.is_none()
@@ -883,6 +900,28 @@ fn write_batch(
         if let Some(src) = state.sources.get_mut(s) {
             rows.extend(src.sync());
         }
+    }
+    if !current.is_empty() {
+        let (mut sources, mut keys, mut values) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut since, mut collected, mut seqs) = (Vec::new(), Vec::new(), Vec::new());
+        for ((source, key), (value, t, c, seq)) in current {
+            sources.push(source);
+            keys.push(key);
+            values.push(value);
+            since.push(t);
+            collected.push(c);
+            seqs.push(seq);
+        }
+        tx.execute(
+            "INSERT INTO akhet_morlet_context_current AS c
+               (sink, collection, source, key, value, since_unix_ns, collected_unix_ns, spool_seq)
+             SELECT $1, $2, * FROM unnest($3::text[], $4::text[], $5::jsonb[], $6::int8[], $7::int8[], $8::int8[])
+             ON CONFLICT (sink, source, key) DO UPDATE SET value=excluded.value,
+               since_unix_ns=excluded.since_unix_ns, collected_unix_ns=excluded.collected_unix_ns,
+               spool_seq=excluded.spool_seq",
+            &[&cfg.sink, &coll, &sources, &keys, &values, &since, &collected, &seqs],
+        )
+        .map_err(classify)?;
     }
     if !rows.is_empty() {
         let first = records.first().map_or(0, |r| r.seq);
