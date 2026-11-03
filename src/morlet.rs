@@ -34,7 +34,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Version of the sink state stored in `akhet_morlet_sinks.state`.
-pub const STATE_VERSION: u32 = 1;
+/// 2: the grids' duplicate-detection windows live in `akhet_morlet_recent`
+/// instead of the state row. Version 1 states are read and migrated on the
+/// next write.
+pub const STATE_VERSION: u32 = 2;
 /// Largest chunk `morlet_append_chunk` accepts.
 const MAX_CHUNK_SAMPLES: usize = 32768;
 /// Closed context intervals retained per key for recordings that start later.
@@ -164,6 +167,102 @@ struct SinkState {
     grids: BTreeMap<String, ChannelGrid>,
     trackers: BTreeMap<String, ContextTracker>,
     sources: BTreeMap<String, SourceCtx>,
+    /// Per channel: timestamp of the last placed sample already stored in
+    /// `akhet_morlet_recent` (from the database on load).
+    #[serde(skip)]
+    persisted_window: BTreeMap<String, i64>,
+}
+
+/// Placed (timestamp, value) pairs as little-endian i64 + f64 (16 bytes each).
+fn encode_placed<'a>(it: impl Iterator<Item = &'a (i64, f64)>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (t, v) in it {
+        out.extend_from_slice(&t.to_le_bytes());
+        out.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    out
+}
+
+fn decode_placed(
+    b: &[u8],
+    out: &mut std::collections::VecDeque<(i64, f64)>,
+) -> Result<(), TxError> {
+    if !b.len().is_multiple_of(16) {
+        return Err(TxError::Fatal(ReplayError::Protocol(
+            "corrupt duplicate-detection window in akhet_morlet_recent".into(),
+        )));
+    }
+    for e in b.as_chunks::<16>().0 {
+        let (t, v) = e.split_at(8);
+        let t = i64::from_le_bytes(t.try_into().expect("8 bytes"));
+        let v = f64::from_bits(u64::from_le_bytes(v.try_into().expect("8 bytes")));
+        out.push_back((t, v));
+    }
+    Ok(())
+}
+
+impl SinkState {
+    /// The state row without the duplicate-detection windows.
+    fn row_without_windows(&mut self) -> Value {
+        let windows: Vec<_> = self
+            .grids
+            .values_mut()
+            .map(|g| g.take_dedup_window())
+            .collect();
+        let v = serde_json::to_value(&*self).expect("state serializes");
+        for (g, w) in self.grids.values_mut().zip(windows) {
+            g.restore_dedup_window(w);
+        }
+        v
+    }
+
+    /// Store the samples placed since the last write, and drop blocks that
+    /// left every window. Two statements, whatever the number of channels.
+    fn persist_windows(
+        &mut self,
+        tx: &mut postgres::Transaction,
+        sink: &str,
+    ) -> Result<(), TxError> {
+        let (mut ch, mut first, mut last, mut data) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut del_ch, mut del_front) = (Vec::new(), Vec::new());
+        for (key, g) in &self.grids {
+            let w = g.dedup_window();
+            let done = self.persisted_window.get(key).copied();
+            let start = match done {
+                Some(d) => w.partition_point(|(t, _)| *t <= d),
+                None => 0,
+            };
+            if start == w.len() {
+                continue;
+            }
+            ch.push(key.clone());
+            first.push(w[start].0);
+            last.push(w[w.len() - 1].0);
+            data.push(encode_placed(w.range(start..)));
+            del_ch.push(key.clone());
+            del_front.push(w[0].0);
+        }
+        if ch.is_empty() {
+            return Ok(());
+        }
+        tx.execute(
+            "DELETE FROM akhet_morlet_recent r USING unnest($2::text[], $3::int8[]) AS d(channel, front)
+             WHERE r.sink=$1 AND r.channel=d.channel AND r.last_unix_ns < d.front",
+            &[&sink, &del_ch, &del_front],
+        )
+        .map_err(classify)?;
+        tx.execute(
+            "INSERT INTO akhet_morlet_recent(sink, channel, first_unix_ns, last_unix_ns, placed)
+             SELECT $1, * FROM unnest($2::text[], $3::int8[], $4::int8[], $5::bytea[])",
+            &[&sink, &ch, &first, &last, &data],
+        )
+        .map_err(classify)?;
+        for (k, t) in ch.into_iter().zip(last) {
+            self.persisted_window.insert(k, t);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -325,6 +424,13 @@ CREATE TABLE IF NOT EXISTS akhet_morlet_evidence(
   rms_deviation_ns float8 NOT NULL,
   spool_seq bigint NOT NULL,
   PRIMARY KEY(collection, recording_id, start_sample));
+CREATE TABLE IF NOT EXISTS akhet_morlet_recent(
+  sink text NOT NULL,
+  channel text NOT NULL,
+  first_unix_ns bigint NOT NULL,
+  last_unix_ns bigint NOT NULL,
+  placed bytea NOT NULL,
+  PRIMARY KEY(sink, channel, first_unix_ns));
 CREATE TABLE IF NOT EXISTS akhet_morlet_issues(
   sink text NOT NULL,
   spool_seq bigint NOT NULL,
@@ -412,6 +518,12 @@ impl<'a> Session<'a> {
                 &[&self.cfg.sink],
             )
             .map_err(classify)?;
+        let blocks = tx
+            .query(
+                "SELECT channel, last_unix_ns, placed FROM akhet_morlet_recent WHERE sink=$1 ORDER BY channel, first_unix_ns",
+                &[&self.cfg.sink],
+            )
+            .map_err(classify)?;
         tx.commit().map_err(classify)?;
         let (collection, sid): (String, String) = (row.get(0), row.get(1));
         if sid != spool_id {
@@ -430,14 +542,36 @@ impl<'a> Session<'a> {
                 )),
             )));
         }
-        let state: SinkState = serde_json::from_value(row.get::<_, Value>(3)).map_err(|e| {
+        let mut state: SinkState = serde_json::from_value(row.get::<_, Value>(3)).map_err(|e| {
             TxError::Fatal(ReplayError::Protocol(format!("unreadable sink state: {e}")))
         })?;
-        if state.version != STATE_VERSION {
-            return Err(TxError::Fatal(ReplayError::Protocol(format!(
-                "sink state version {} is not supported (this build: {STATE_VERSION})",
-                state.version
-            ))));
+        match state.version {
+            // Windows are inside the grids; written out on the next commit.
+            1 => state.version = STATE_VERSION,
+            STATE_VERSION => {
+                let mut windows: BTreeMap<String, std::collections::VecDeque<(i64, f64)>> =
+                    BTreeMap::new();
+                for b in &blocks {
+                    let key: String = b.get(0);
+                    decode_placed(b.get(2), windows.entry(key.clone()).or_default())?;
+                    state.persisted_window.insert(key, b.get(1));
+                }
+                for (key, w) in windows {
+                    match state.grids.get_mut(&key) {
+                        Some(g) => g.restore_dedup_window(w),
+                        None => {
+                            return Err(TxError::Fatal(ReplayError::Protocol(format!(
+                                "duplicate-detection window for unknown channel {key:?}"
+                            ))));
+                        }
+                    }
+                }
+            }
+            v => {
+                return Err(TxError::Fatal(ReplayError::Protocol(format!(
+                    "sink state version {v} is not supported (this build: {STATE_VERSION})"
+                ))));
+            }
         }
         Ok((row.get(2), state))
     }
@@ -766,7 +900,8 @@ fn write_batch(
         stats.context_rows += rows.len() as u64;
     }
     let last_seq = records.last().map_or(expected_checkpoint, |r| r.seq);
-    let state_json = serde_json::to_value(&*state).expect("state serializes");
+    state.persist_windows(&mut tx, &cfg.sink)?;
+    let state_json = state.row_without_windows();
     tx.execute(
         "UPDATE akhet_morlet_sinks SET checkpoint_seq=$2, state=$3, updated_at=now() WHERE sink=$1",
         &[&cfg.sink, &last_seq, &state_json],

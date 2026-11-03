@@ -324,6 +324,33 @@ impl ChannelGrid {
         &self.report
     }
 
+    /// The duplicate-detection window: the last `dedup_window_samples`
+    /// placed (original timestamp, value) pairs, ascending timestamps. It is
+    /// always the most recent placed samples, so a consumer that persists
+    /// placed samples incrementally can rebuild it with
+    /// [`restore_dedup_window`](Self::restore_dedup_window).
+    pub fn dedup_window(&self) -> &VecDeque<(i64, f64)> {
+        &self.recent
+    }
+
+    pub fn dedup_window_samples(&self) -> usize {
+        self.spec.dedup_window_samples
+    }
+
+    /// Move the window out (e.g. to serialize the rest of the state without
+    /// it); put it back with `restore_dedup_window`.
+    pub fn take_dedup_window(&mut self) -> VecDeque<(i64, f64)> {
+        std::mem::take(&mut self.recent)
+    }
+
+    /// Replace the window with the last `dedup_window_samples` of `placed`
+    /// (ascending timestamps).
+    pub fn restore_dedup_window(&mut self, mut placed: VecDeque<(i64, f64)>) {
+        let excess = placed.len().saturating_sub(self.spec.dedup_window_samples);
+        placed.drain(..excess);
+        self.recent = placed;
+    }
+
     pub fn channel_key(&self) -> &str {
         &self.channel_key
     }

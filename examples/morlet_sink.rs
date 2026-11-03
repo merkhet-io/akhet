@@ -11,7 +11,9 @@
 //! into a fresh collection and prints one JSON line:
 //! samples/s and chunks/s over the whole replay, transactions, mean time per
 //! transaction, mean samples per chunk, and the size of the sink state in
-//! `akhet_morlet_sinks` (text bytes and stored bytes) after the run.
+//! `akhet_morlet_sinks` (text bytes and stored bytes) after the run. The
+//! duplicate-detection windows are stored separately (`akhet_morlet_recent`)
+//! and not included.
 //!
 //! Development tooling only. It creates tables named `akhet_bench_*` in the
 //! target database and drops them unless `--keep` is given; use a disposable
@@ -182,6 +184,8 @@ fn main() {
                 .unwrap();
         }
         db.execute("DELETE FROM akhet_morlet_sinks WHERE sink=$1", &[&sink])
+            .unwrap();
+        db.execute("DELETE FROM akhet_morlet_recent WHERE sink=$1", &[&sink])
             .unwrap();
         db.execute(
             "DELETE FROM akhet_morlet_evidence WHERE collection=$1",

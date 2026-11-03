@@ -200,8 +200,8 @@ Chunks/s after: 38 / 18 (25.6 kHz), 81 / 71 (1 kHz), 61 / 53 (100 Hz).
   kept up with neither.
 - With extraction, a larger share of the remaining time is spent inside
   pg_morlet (feature extraction in the append).
-- For small messages the remaining per-transaction cost is mostly fixed: the
-  statements per record, and rewriting the 1–2 MB sink state row (#28).
+- For small messages, part of the remaining per-transaction cost was
+  rewriting the 1–2 MB sink state row; see the next section (#28).
   The transaction took 65–100 ms for 8 chunks of 1 000 samples.
 - Not done: several chunks per call (`morlet_append_chunks`) and statement
   pipelining. After merging there is usually one chunk per recording and
@@ -209,3 +209,34 @@ Chunks/s after: 38 / 18 (25.6 kHz), 81 / 71 (1 kHz), 61 / 53 (100 Hz).
   is not in 0.3.3-alpha.1.
 - Crash tests (all three fault points) still show no lost or duplicated
   samples, and the evidence rows still tile every recording exactly.
+
+### Sink state size (#28)
+
+The sink state row (`akhet_morlet_sinks.state`) is rewritten in every
+transaction. Synthetic shape: N channels × 100 Hz, 100 samples per message,
+120 messages (12 000 samples per channel, so the 8 192-sample duplicate
+window is full), 20 records per transaction, 6 transactions, extractor
+`none`. One run per row, same setup as above.
+
+| channels | state row before (text / stored) | after (text / stored) | ms per transaction before | after | samples/s before | after |
+|---|---|---|---|---|---|---|
+| 10 | 2.50 MB / 0.59 MB | 10.7 KB / 1.1 KB | 123 | 65 | 162 135 | 307 876 |
+| 100 | 25.0 MB / 5.9 MB | 106 KB / 3.7 KB | 1 057 | 416 | 189 133 | 480 637 |
+| 1 000 | **fails**: PostgreSQL rejects the jsonb (over 256 MB) | 1.07 MB / 31.8 KB | - | 3 931 | - | 508 776 |
+
+- **Before:** almost all of the state was the duplicate-detection window
+  (8 192 timestamp/value pairs per channel, about 250 KB of JSON per
+  channel), rewritten in full on every transaction. At 1 000 channels the
+  first transaction failed outright.
+- **After:**
+  - The windows are stored separately in `akhet_morlet_recent` as binary
+    blocks (16 bytes per sample). Each transaction inserts only the samples
+    placed in it and deletes blocks that left the window: two statements,
+    whatever the number of channels.
+  - That table holds at most the window plus one block per channel (here
+    10 000 samples, 160 KB per channel).
+  - The state row now grows by about 1 KB per channel. At 1 000 channels the
+    transaction time is dominated by the 1 000 chunk appends.
+- Per-channel state rows (the issue's second proposal) were not needed:
+  every active channel changes in every transaction, so it would not reduce
+  the bytes written.
