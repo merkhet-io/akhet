@@ -182,6 +182,18 @@ enum Command {
         #[arg(long, requires = "chunks")]
         samples: bool,
     },
+    /// Build context timelines (change events) from decoded context signals
+    /// (read-only). Prints change events and issues as JSON lines, then a
+    /// summary per channel.
+    Context {
+        /// Decoder config file (JSON); rules list `context_signals`.
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     Receive {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
@@ -464,6 +476,27 @@ fn main() -> ExitCode {
                 Err(e) => fail(spool_exit(&e), e),
             }
         }
+        Command::Context {
+            config,
+            after,
+            limit,
+        } => {
+            let cfg = match akhet::decode::DecoderConfig::load(&config) {
+                Ok(c) => c,
+                Err(e) => return fail(2, e),
+            };
+            let spool = match open() {
+                Ok(s) => s,
+                Err(e) => return fail(spool_exit(&e), e),
+            };
+            match context_spool(&spool, &cfg, after, limit) {
+                Ok(summary) => {
+                    print_json(&summary);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(spool_exit(&e), e),
+            }
+        }
         Command::Receive { listen, db } => {
             let spool = match Spool::open_with_limits(&db, cli.max_db_bytes, cli.max_event_bytes) {
                 Ok(s) => s,
@@ -498,6 +531,8 @@ struct DecodeSummary {
     records_with_issues: u64,
     channel_batches: u64,
     samples: u64,
+    context_batches: u64,
+    context_observations: u64,
     issues_by_kind: std::collections::BTreeMap<String, u64>,
     last_seq: i64,
 }
@@ -540,6 +575,9 @@ fn decode_spool(
                 *sum.issues_by_kind.entry(k).or_default() += 1;
             }
             sum.channel_batches += d.batches.len() as u64;
+            sum.context_batches += d.context.len() as u64;
+            sum.context_observations +=
+                d.context.iter().map(|b| b.values.len() as u64).sum::<u64>();
             sum.samples += d.batches.iter().map(|b| b.values.len() as u64).sum::<u64>();
             if summary_only {
                 continue;
@@ -565,6 +603,7 @@ fn decode_spool(
                 "seq": r.seq,
                 "event_id": r.event_id,
                 "batches": batches,
+                "context": d.context,
                 "issues": d.issues,
             }));
         }
@@ -639,6 +678,52 @@ fn grid_spool(
         }
         channels.push(serde_json::json!({"channel": id, "report": g.report()}));
     }
+    Ok(serde_json::json!({
+        "summary": true,
+        "last_seq": last_seq,
+        "decode_issues": decode_issues,
+        "channels": channels,
+    }))
+}
+
+fn context_spool(
+    spool: &Spool,
+    cfg: &akhet::decode::DecoderConfig,
+    mut after: i64,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, SpoolError> {
+    use akhet::context::ContextTracker;
+    let mut trackers: std::collections::BTreeMap<akhet::decode::ChannelId, ContextTracker> =
+        Default::default();
+    let mut decode_issues = 0u64;
+    let mut last_seq = after;
+    let mut left = limit.unwrap_or(usize::MAX);
+    while left > 0 {
+        let batch = spool.read_after(after, left.min(256))?;
+        let Some(last) = batch.last() else { break };
+        after = last.seq;
+        left -= batch.len();
+        for r in batch {
+            last_seq = r.seq;
+            let ev = akhet::event::decode(&r.body)?;
+            let Some(d) = cfg.decode_event(&ev) else {
+                continue;
+            };
+            decode_issues += d.issues.len() as u64;
+            for b in &d.context {
+                let t = trackers
+                    .entry(b.channel.clone())
+                    .or_insert_with(|| ContextTracker::new(b.channel.clone()));
+                for o in t.push(&b.timestamps_unix_ns, &b.values, ev.collected_unix_ns) {
+                    print_json(&serde_json::json!({"seq": r.seq, "output": o}));
+                }
+            }
+        }
+    }
+    let channels: Vec<serde_json::Value> = trackers
+        .iter()
+        .map(|(id, t)| serde_json::json!({"channel": id, "report": t.report()}))
+        .collect();
     Ok(serde_json::json!({
         "summary": true,
         "last_seq": last_seq,
