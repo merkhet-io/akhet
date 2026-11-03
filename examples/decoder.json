@@ -1,0 +1,32 @@
+{
+  "format_version": 1,
+  "rules": [
+    {
+      "name": "sensor-hub",
+      "topic": "sensors/+/batch",
+      "source": "{topic.1}",
+      "groups": "/groups",
+      "group": "{group:/name}",
+      "timestamps": "/timestamps",
+      "timestamp_unit": "us",
+      "signals": { "map": "/signals" },
+      "units": { "accel_x": "g", "accel_y": "g", "accel_z": "g", "current": "A" },
+      "metadata": { "line": "line-1" }
+    },
+    {
+      "name": "controller",
+      "topic": "plant/+/controller",
+      "source": "{/machine}",
+      "group": "dynamics",
+      "timestamps": "/t",
+      "timestamp_unit": "ms",
+      "signals": {
+        "list": [
+          { "name": "spindle_load", "pointer": "/load" },
+          { "name": "spindle_speed", "pointer": "/speed" }
+        ]
+      },
+      "units": { "spindle_load": "%", "spindle_speed": "1/min" }
+    }
+  ]
+}

@@ -589,6 +589,28 @@ impl Spool {
         Ok(n)
     }
 
+    /// Read a value from the spool's `meta` table (collector bookkeeping, not
+    /// events; never replayed).
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Durably insert or replace a value in the `meta` table (one autocommit
+    /// transaction, same synchronous settings as appends).
+    pub fn meta_set(&mut self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )
+            .map_err(|e| self.map_full(e))?;
+        Ok(())
+    }
+
     /// Direct access for tests and fault injection.
     #[doc(hidden)]
     pub fn connection(&self) -> &Connection {

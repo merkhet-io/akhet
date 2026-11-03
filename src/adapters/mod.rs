@@ -109,6 +109,30 @@ impl AsyncSpool {
         .map_err(|e| SpoolError::Io(std::io::Error::other(format!("spool task failed: {e}"))))?
     }
 
+    /// Read a `meta` value on the blocking pool.
+    pub async fn meta_get(&self, key: &str) -> Result<Option<String>, SpoolError> {
+        let inner = self.inner.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let s = inner.lock().unwrap_or_else(|p| p.into_inner());
+            s.meta_get(&key)
+        })
+        .await
+        .map_err(|e| SpoolError::Io(std::io::Error::other(format!("spool task failed: {e}"))))?
+    }
+
+    /// Durably write a `meta` value on the blocking pool.
+    pub async fn meta_set(&self, key: &str, value: &str) -> Result<(), SpoolError> {
+        let inner = self.inner.clone();
+        let (key, value) = (key.to_string(), value.to_string());
+        tokio::task::spawn_blocking(move || {
+            let mut s = inner.lock().unwrap_or_else(|p| p.into_inner());
+            s.meta_set(&key, &value)
+        })
+        .await
+        .map_err(|e| SpoolError::Io(std::io::Error::other(format!("spool task failed: {e}"))))?
+    }
+
     pub fn faults(&self) -> &Faults {
         &self.faults
     }
