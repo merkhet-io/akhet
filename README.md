@@ -265,6 +265,16 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
   estimated, the tolerance and the discontinuity that started it. Chunks go
   through `morlet_append_chunk` at the grid's sample offsets; values are sent
   as binary float64 and read back bit-exactly.
+- **Chunks:** within one transaction, the contiguous samples of a recording
+  are merged into one chunk of at most the channel's `max_chunk_samples`
+  (default and MorletDB maximum 32,768). They are written before the
+  transaction's context rows and its commit.
+  - With small messages, chunk size therefore follows `--records-per-tx`,
+    not the message size: for example, 100 records of 10 samples give
+    1,000-sample chunks.
+  - A gap, a new recording or the size limit starts a new chunk.
+  - Committed records are never sent again, so different chunk boundaries
+    between runs cannot conflict.
 - **Feature extraction:** on by default, so recordings are searchable by
   features (`morlet_search_interval`, `morlet_search_streams`). With
   `--extractor auto` (the default) each new recording gets pg_morlet's
@@ -282,8 +292,11 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
   - Similarity search by envelopes (`morlet_search_similar`) is separate: it
     needs `morlet_enable_envelopes` and `morlet_build_envelopes`, which the
     sink does not run.
-- **Timing evidence:** per chunk in `akhet_morlet_evidence` (first/last
-  original timestamp, max/RMS deviation, spool seq).
+- **Timing evidence:** per chunk in `akhet_morlet_evidence`:
+  - first and last original timestamp;
+  - max and RMS deviation over the merged samples;
+  - the last spool seq that contributed samples.
+  Evidence rows tile each recording exactly.
 - **Explicit issues:** decode, timing and context issues go to
   `akhet_morlet_issues` (sink, spool seq, kind and details).
 - **Context:** for each context key of a source, the value in effect becomes

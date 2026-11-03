@@ -25,7 +25,7 @@ use crate::faults::{Faults, point};
 use crate::pgtls::{PgConnect, SslMode};
 use crate::replay::{ReplayError, SinkLock};
 use crate::spool::Spool;
-use crate::timing::{ChannelGrid, GridOutput};
+use crate::timing::{ChannelGrid, Chunk, GridOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 
 /// Version of the sink state stored in `akhet_morlet_sinks.state`.
 pub const STATE_VERSION: u32 = 1;
+/// Largest chunk `morlet_append_chunk` accepts.
+const MAX_CHUNK_SAMPLES: usize = 32768;
 /// Closed context intervals retained per key for recordings that start later.
 const RETAINED_INTERVALS: usize = 64;
 
@@ -441,6 +443,81 @@ impl<'a> Session<'a> {
     }
 }
 
+/// Samples of one recording collected within a transaction, written as
+/// one chunk. Messages usually carry far fewer samples than a chunk can
+/// hold, and every append costs a statement, so contiguous grid chunks of a
+/// recording are merged up to the channel's `max_chunk_samples` before they
+/// are sent.
+struct PendingChunk {
+    chunk: Chunk,
+    /// Sample count of each merged grid chunk (for the RMS deviation).
+    parts: Vec<(usize, f64)>,
+    max_samples: usize,
+    /// Last spool record that contributed samples.
+    spool_seq: i64,
+}
+
+impl PendingChunk {
+    fn end(&self) -> u64 {
+        self.chunk.start_sample + self.chunk.values.len() as u64
+    }
+
+    /// Append `c` if it continues this chunk and fits; otherwise hand it back.
+    fn try_extend(&mut self, c: Chunk, seq: i64) -> Result<(), Chunk> {
+        if c.recording != self.chunk.recording
+            || c.start_sample != self.end()
+            || self.chunk.values.len() + c.values.len() > self.max_samples
+        {
+            return Err(c);
+        }
+        let e = &mut self.chunk.evidence;
+        e.last_unix_ns = c.evidence.last_unix_ns;
+        e.max_abs_deviation_ns = e.max_abs_deviation_ns.max(c.evidence.max_abs_deviation_ns);
+        self.parts
+            .push((c.values.len(), c.evidence.rms_deviation_ns));
+        let (n, sq) = self.parts.iter().fold((0usize, 0f64), |(n, sq), &(k, r)| {
+            (n + k, sq + k as f64 * r * r)
+        });
+        e.rms_deviation_ns = (sq / n as f64).sqrt();
+        self.chunk.values.extend_from_slice(&c.values);
+        self.spool_seq = seq;
+        Ok(())
+    }
+}
+
+fn write_chunk(
+    tx: &mut postgres::Transaction,
+    coll: &str,
+    p: PendingChunk,
+    stats: &mut TxStats,
+) -> Result<(), TxError> {
+    let c = &p.chunk;
+    tx.execute(
+        "SELECT morlet_append_chunk($1::text::regclass,$2,$3,$4)",
+        &[&coll, &c.recording, &(c.start_sample as i64), &c.values],
+    )
+    .map_err(classify)?;
+    tx.execute(
+        "INSERT INTO akhet_morlet_evidence VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT DO NOTHING",
+        &[
+            &coll,
+            &c.recording,
+            &(c.start_sample as i64),
+            &(c.values.len() as i32),
+            &c.evidence.first_unix_ns,
+            &c.evidence.last_unix_ns,
+            &c.evidence.max_abs_deviation_ns,
+            &c.evidence.rms_deviation_ns,
+            &p.spool_seq,
+        ],
+    )
+    .map_err(classify)?;
+    stats.chunks += 1;
+    stats.samples += c.values.len() as u64;
+    Ok(())
+}
+
 /// Counters for one transaction.
 #[derive(Default)]
 struct TxStats {
@@ -477,6 +554,8 @@ fn write_batch(
         ))));
     }
     let mut touched: Vec<String> = Vec::new();
+    // Per recording: samples not yet sent (see PendingChunk).
+    let mut pending: BTreeMap<String, PendingChunk> = BTreeMap::new();
     for rec in records {
         let ev =
             event::decode(&rec.body).map_err(|e| TxError::Fatal(ReplayError::Spool(e.into())))?;
@@ -579,32 +658,29 @@ fn write_batch(
                         stats.recordings += 1;
                     }
                     GridOutput::Chunk(c) => {
-                        tx.execute(
-                            "SELECT morlet_append_chunk($1::text::regclass,$2,$3,$4)",
-                            &[&coll, &c.recording, &(c.start_sample as i64), &c.values],
-                        )
-                        .map_err(classify)?;
-                        tx.execute(
-                            "INSERT INTO akhet_morlet_evidence VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                             ON CONFLICT DO NOTHING",
-                            &[
-                                &coll,
-                                &c.recording,
-                                &(c.start_sample as i64),
-                                &(c.values.len() as i32),
-                                &c.evidence.first_unix_ns,
-                                &c.evidence.last_unix_ns,
-                                &c.evidence.max_abs_deviation_ns,
-                                &c.evidence.rms_deviation_ns,
-                                &rec.seq,
-                            ],
-                        )
-                        .map_err(classify)?;
                         if let Some(r) = src.recordings.get_mut(&c.recording) {
                             r.last_unix_ns = c.evidence.last_unix_ns;
                         }
-                        stats.chunks += 1;
-                        stats.samples += c.values.len() as u64;
+                        let c = match pending.get_mut(&c.recording) {
+                            Some(p) => match p.try_extend(c, rec.seq) {
+                                Ok(()) => continue,
+                                Err(c) => {
+                                    let full = pending.remove(&c.recording).expect("present");
+                                    write_chunk(&mut tx, coll, full, stats)?;
+                                    c
+                                }
+                            },
+                            None => c,
+                        };
+                        pending.insert(
+                            c.recording.clone(),
+                            PendingChunk {
+                                parts: vec![(c.values.len(), c.evidence.rms_deviation_ns)],
+                                chunk: c,
+                                max_samples: spec.max_chunk_samples.min(MAX_CHUNK_SAMPLES),
+                                spool_seq: rec.seq,
+                            },
+                        );
                     }
                     GridOutput::End {
                         recording,
@@ -664,6 +740,9 @@ fn write_batch(
                 }
             }
         }
+    }
+    for p in std::mem::take(&mut pending).into_values() {
+        write_chunk(&mut tx, coll, p, stats)?;
     }
     let mut rows = Vec::new();
     for s in &touched {
