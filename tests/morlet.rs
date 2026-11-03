@@ -171,6 +171,11 @@ fn morlet_run_url(
         "--max-attempts",
         "2",
     ];
+    if extra.contains(&"--records-per-tx") {
+        // Overridden by the caller.
+        let i = args.iter().position(|a| *a == "--records-per-tx").unwrap();
+        args.drain(i..i + 2);
+    }
     args.extend_from_slice(extra);
     let mut c = akhet(spool, &args, fault);
     c.env("AKHET_MORLET_URL", url);
@@ -313,15 +318,12 @@ fn replays_bit_exact_with_gaps_duplicates_and_context() {
     assert_exact(&coll, &want);
 
     // Timing evidence and binding.
-    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
-    let n: i64 = db
-        .query_one(
-            "SELECT count(*) FROM akhet_morlet_evidence WHERE collection=$1 AND max_abs_deviation_ns=0",
-            &[&coll],
-        )
-        .unwrap()
-        .get(0);
-    assert_eq!(n, 2 * 9);
+    let ev = evidence(&coll);
+    assert!(ev.iter().all(|e| e.max_abs_deviation_ns == 0.0));
+    assert_eq!(chunk_count(&coll), ev.len());
+    // Chunks are merged within a transaction (2 records here), so there are
+    // fewer than the 18 messages x channels.
+    assert!(ev.len() < 2 * 9, "{} chunks", ev.len());
     let st = run(&spool, &["status"], None);
     let v: serde_json::Value = serde_json::from_slice(&st.stdout).unwrap();
     assert_eq!(v["sinks"][0]["pending_records"], 0);
@@ -338,6 +340,105 @@ fn replays_bit_exact_with_gaps_duplicates_and_context() {
             .contains("morlet-test"),
         "no password"
     );
+}
+
+#[derive(Debug)]
+struct Evidence {
+    recording: String,
+    start: i64,
+    count: i64,
+    first_ns: i64,
+    last_ns: i64,
+    max_abs_deviation_ns: f64,
+}
+
+/// Evidence rows in sample order; checks they tile every recording exactly
+/// (no gap, no overlap, sample counts add up) and that their timestamps are
+/// the original ones of the first and last sample.
+fn evidence(coll: &str) -> Vec<Evidence> {
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let ev: Vec<Evidence> = db
+        .query(
+            "SELECT recording_id, start_sample, sample_count, first_unix_ns, last_unix_ns, max_abs_deviation_ns
+             FROM akhet_morlet_evidence WHERE collection=$1 ORDER BY 1, 2",
+            &[&coll],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| Evidence {
+            recording: r.get(0),
+            start: r.get(1),
+            count: r.get::<_, i32>(2) as i64,
+            first_ns: r.get(3),
+            last_ns: r.get(4),
+            max_abs_deviation_ns: r.get(5),
+        })
+        .collect();
+    let lens: BTreeMap<String, i64> = db
+        .query(
+            &format!(
+                "SELECT r.recording_id, s.received_samples FROM {coll} r, morlet_stream_status($1::text::regclass, r.recording_id) s"
+            ),
+            &[&coll],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    for (rec, n) in &lens {
+        let mut next = 0;
+        for e in ev.iter().filter(|e| &e.recording == rec) {
+            assert_eq!(e.start, next, "{rec}: evidence must tile the recording");
+            // 40 kHz, exact grid: sample k of the recording is 25 us after k-1.
+            assert_eq!(
+                e.last_ns - e.first_ns,
+                (e.count - 1) * 25_000,
+                "{rec}@{}",
+                e.start
+            );
+            next += e.count;
+        }
+        assert_eq!(next, *n, "{rec}: evidence covers all samples");
+    }
+    ev
+}
+
+fn chunk_count(coll: &str) -> usize {
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let n: i64 = db
+        .query_one(&format!("SELECT count(*) FROM {coll}_chunks"), &[])
+        .unwrap()
+        .get(0);
+    n as usize
+}
+
+#[test]
+#[ignore = "needs AKHET_TEST_MORLET_URL"]
+fn one_transaction_writes_one_chunk_per_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("s.sqlite");
+    let want = build_spool(&spool);
+    let cfg = decoder_file(dir.path());
+    let coll = unique("akhet_one");
+    let out = morlet_run_args(
+        &spool,
+        &cfg,
+        &unique("s"),
+        &coll,
+        None,
+        &["--records-per-tx", "100"],
+    );
+    assert!(out.status.success());
+    let s = stdout_json(&out);
+    assert_eq!(
+        (s["transactions"].as_u64(), s["chunks"].as_u64()),
+        (Some(1), Some(4))
+    );
+    assert_exact(&coll, &want);
+    let ev = evidence(&coll);
+    assert_eq!(ev.len(), 4);
+    assert_eq!(chunk_count(&coll), 4);
+    assert_searchable(&coll);
 }
 
 /// Default extractor (`auto`): every 40 kHz recording has
@@ -440,6 +541,7 @@ fn crashes_lose_and_duplicate_nothing() {
         assert_exact(&coll, &want);
         assert_eq!(context_rows(&coll).len(), 6, "{fault}");
         assert_searchable(&coll);
+        evidence(&coll);
         eprintln!("{fault}: {crashes} crashes, exact");
     }
 }

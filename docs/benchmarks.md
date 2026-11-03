@@ -169,12 +169,43 @@ Three runs per row, median, 2026-11-03.
 
 - Extraction at ingest cost about 29% of sink throughput at 25.6 kHz and
   about 12% at 100 Hz on pg_morlet 0.3.3-alpha.1.
-- Both shapes are bound by per-chunk cost: the sink writes one chunk per
-  channel and message (mean chunk = samples per message), about 2.5 ms per
-  chunk including its evidence row. At 8 × 25.6 kHz the source produces
-  204 800 samples/s, about twice what the sink sustains here. Chunk
-  coalescing is tracked in #26.
+- These numbers were taken before chunk coalescing (#26, below), when the
+  sink wrote one chunk per channel and message and both shapes were bound by
+  per-chunk cost.
 - The sink state row was 2.0 MB as text (0.55 MB stored) for 8 channels and
   1.0 MB for 4 channels, mostly the duplicate-detection window
   (`dedup_window_samples`, 8192 timestamp/value pairs per channel). It is
   rewritten on every transaction; see #28.
+
+### Chunk coalescing (#26)
+
+Before: one `morlet_append_chunk` (and one evidence row) per channel and
+message, so the mean chunk equals the samples per message. After: contiguous
+samples of a recording are merged within the transaction (here 100 records
+per transaction), up to 32 768 samples. Same setup as above, 3 runs, median.
+
+| shape | extractor | mean chunk before → after | samples/s before | samples/s after | speed-up |
+|---|---|---|---|---|---|
+| 8 ch × 25.6 kHz, 256 samples/message, 400 messages | `none` | 256 → 25 600 | 100 965 | 983 069 | 9.7× |
+| 8 ch × 25.6 kHz, 256 samples/message, 400 messages | `auto` | 256 → 25 600 | 71 465 | 453 633 | 6.3× |
+| 8 ch × 1 kHz, 10 samples/message, 2 000 messages | `none` | 10 → 1 000 | 4 447 | 80 988 | 18× |
+| 8 ch × 1 kHz, 10 samples/message, 2 000 messages | `auto` | 10 → 1 000 | 3 648 | 70 762 | 19× |
+| 4 ch × 100 Hz, 10 samples/message, 2 000 messages | `none` | 10 → 1 000 | 4 121 | 61 337 | 15× |
+| 4 ch × 100 Hz, 10 samples/message, 2 000 messages | `auto` | 10 → 1 000 | 3 619 | 53 080 | 15× |
+
+Chunks/s after: 38 / 18 (25.6 kHz), 81 / 71 (1 kHz), 61 / 53 (100 Hz).
+
+- 8 × 25.6 kHz (204 800 samples/s at the source) is now ingested at about
+  4.8× the source rate without extraction and 2.2× with it; before, the sink
+  kept up with neither.
+- With extraction, a larger share of the remaining time is spent inside
+  pg_morlet (feature extraction in the append).
+- For small messages the remaining per-transaction cost is mostly fixed: the
+  statements per record, and rewriting the 1–2 MB sink state row (#28).
+  The transaction took 65–100 ms for 8 chunks of 1 000 samples.
+- Not done: several chunks per call (`morlet_append_chunks`) and statement
+  pipelining. After merging there is usually one chunk per recording and
+  transaction, so few round trips remain. `morlet_append_chunk_raw` (bytea)
+  is not in 0.3.3-alpha.1.
+- Crash tests (all three fault points) still show no lost or duplicated
+  samples, and the evidence rows still tile every recording exactly.
