@@ -156,6 +156,31 @@ round-trip through float64.
 Decoding does not interpret timing: it reports the publisher's timestamps
 as given. Converting timestamps to a uniform sample grid is a separate step.
 
+### Context timelines (read-only)
+
+Controller signals such as program number, tool, part count or feed override
+change irregularly and are not waveforms. List them in a rule's
+`context_signals`; their values may be numbers, strings (up to 1024 bytes) or
+booleans and need no unit (`bad_context_value` otherwise).
+
+`akhet context --config <file>` turns their observations into change events
+with last-value-held semantics, printed as JSON lines with a summary per
+channel:
+
+- Repeated observations of the value in effect produce no event.
+- A newer observation with a different value is a change event with the
+  publisher timestamp (`clock: "source"`), the collector timestamp of the
+  message (`collected_unix_ns`) and the previous value.
+- A late or out-of-order observation never rewrites the timeline: if it agrees
+  with the value in effect at its time it is counted as `late_consistent`
+  (this absorbs redelivered messages); otherwise it is a `late_conflict` issue,
+  or `late_unknown` when it predates the retained history (4096 changes per
+  channel).
+
+The timeline is a deterministic function of the spooled records in order, so
+it can be rebuilt exactly from the spool. Values compare as JSON values (`1`
+and `1.0` differ).
+
 ## Delivery semantics
 
 ### MQTT → spool: at-least-once, acknowledged after durable commit
@@ -332,7 +357,8 @@ graceful shutdown leaving uncommitted messages unacknowledged; Modbus timeout,
 exception and reconnect with explicit failed observations; concurrent-replayer
 exclusion and sink binding; TLS with a trusted and an untrusted CA; payload
 decoding of multi-group batches (bit-exact values) and explicit issues for
-malformed payloads.
+malformed payloads; context timelines with repeated values, redelivered and
+late contradicting observations, rebuilt identically from the spool.
 
 Against an external broker (CI runs this with Mosquitto 2):
 
