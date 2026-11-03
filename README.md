@@ -231,6 +231,65 @@ The timeline is a deterministic function of the spooled records in order, so
 it can be rebuilt exactly from the spool. Values compare as JSON values (`1`
 and `1.0` differ).
 
+### MorletDB sink
+
+`akhet morlet` replays the spool into PostgreSQL with the `pg_morlet`
+extension. Per record: `decode` → `grid` per waveform channel → recordings and
+chunks in a MorletDB stream collection; `context_signals` → interval rows in
+the collection's context timeline.
+
+```sh
+export AKHET_MORLET_URL='postgresql://user:password@db.example:5432/morlet'   # never on argv
+akhet --spool data/s.sqlite morlet --sink central --collection signals \
+  --config decoder.json --create-collection --follow
+```
+
+- **Recordings:** one per grid recording, created with
+  `morlet_ensure_recording(rate, channel = "<source>/<group>/<signal>", unit,
+  metadata)`. Metadata holds the rule's static metadata plus an `akhet`
+  object: source, group, signal, anchor timestamp, whether the rate was
+  estimated, the tolerance and the discontinuity that started it. Chunks go
+  through `morlet_append_chunk` at the grid's sample offsets; values are sent
+  as binary float64 and read back bit-exactly.
+- **Timing evidence:** per chunk in `akhet_morlet_evidence` (first/last
+  original timestamp, max/RMS deviation, spool seq).
+- **Explicit issues:** decode, timing and context issues go to
+  `akhet_morlet_issues` (sink, spool seq, kind and details).
+- **Context:** for each context key of a source, the value in effect becomes
+  an interval `[start_sample, end_sample)` on every recording of the same
+  source it overlaps (key = signal name). An interval is written once its end
+  is known: at the next change, or clipped at the end of a recording. The
+  value still in effect on an active recording is not written yet. Times map
+  to the first sample at or after the change.
+- **Exactness:** derived state (grid state per channel, context timelines,
+  written context offsets) lives in `akhet_morlet_sinks` and is updated **in
+  the same transaction** as the samples, context rows and the sink's spool
+  checkpoint. On any error or crash, the transaction rolls back and the sink
+  resumes from the committed state. The local checkpoint is advanced after the
+  commit and moved forward from the database if a crash came in between; a
+  database checkpoint *behind* the local one (restored database) is refused.
+  Crash tests at the existing replay fault points show no lost or duplicated
+  samples.
+- **Binding:** the database gets a random `database_id` (table
+  `akhet_morlet_identity`), used like a receiver identity; a sink name is
+  bound to one spool, one collection and one database. Re-using it elsewhere
+  is refused (exit 3).
+- **Errors:** connection-class failures are retried with bounded backoff
+  (exit 6 when exhausted). Anything MorletDB rejects (conflicting samples at
+  an existing offset, overlapping context, a rate or chunk it refuses) is
+  permanent (exit 5), with the database message.
+- **Privileges:** the role needs to create the `akhet_morlet_*` tables in its
+  schema (once) and use the collection; `--create-collection` additionally
+  creates the stream collection and its context tables.
+
+Limits: the connection has no TLS yet (use a local socket, a VPN or a
+TLS-terminating proxy). One sink transaction holds `--records-per-tx`
+records; the stored state grows with the number of channels and
+`dedup_window_samples`, and is rewritten on every transaction. Two sinks must
+not write the same recordings. Feature extraction defaults to `none` (raw
+storage only); `--extractor`, `--window-size`, `--stride`, `--normalization`
+and `--sample-quantum` are passed to MorletDB for new recordings.
+
 ## Delivery semantics
 
 ### MQTT → spool: at-least-once, acknowledged after durable commit
@@ -384,6 +443,9 @@ and `1.0` differ).
 | 6 | Receiver unavailable after bounded retries |
 | 7 | Another replayer holds this sink |
 
+`akhet morlet` uses the same codes: 3 for sink binding mismatches, 5 for writes
+MorletDB rejects, 6 when the database stays unreachable, 2 for configuration.
+
 ## Verification
 
 ```sh
@@ -417,15 +479,21 @@ Against an external broker (CI runs this with Mosquitto 2):
 AKHET_TEST_BROKER_PORT=1883 cargo test --locked --test mqtt_external -- --ignored
 ```
 
+Against MorletDB (CI runs this with the published pg_morlet image; see the
+header of `tests/morlet.rs`):
+
+```sh
+AKHET_TEST_MORLET_URL=postgresql://morlet:morlet-test@127.0.0.1:54339/morlet \
+  cargo test --locked --test morlet -- --ignored --test-threads=1
+```
+
 Not covered: power-failure durability, broker restarts with persistence, real
 Modbus devices, long-duration soak tests, throughput or latency benchmarks.
 
 ## Scope boundaries
 
-- No MorletDB integration yet. `decode` and `grid` supply payload schema,
-  units, channel and recording identity, sample rate and gaps; a sink that
-  writes them is not implemented. Irregular Modbus polls are not a uniform
-  waveform.
+- The MorletDB sink handles MQTT payloads decoded by rules. Irregular Modbus
+  polls are not a uniform waveform and are not written to MorletDB.
 - No ML, adaptive discarding, Parquet conversion, custom storage engine,
   retention/deletion, fleet management or performance claims.
 
