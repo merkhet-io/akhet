@@ -78,6 +78,11 @@ pub struct Rule {
     /// Absent: the default (estimated rate, 10% of a period tolerance).
     #[serde(default)]
     pub timing: Option<crate::timing::TimingSpec>,
+    /// Signal names decoded as context (controller state such as program,
+    /// tool or part count) instead of waveform samples. Their values may be
+    /// numbers, strings or booleans and need no unit.
+    #[serde(default)]
+    pub context_signals: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +180,8 @@ pub enum IssueKind {
     NonMonotonicTimestamps,
     /// A signal has no configured unit and no default unit is set.
     NoUnit,
+    /// A context value is not a number, string or boolean.
+    BadContextValue,
     /// A batch exceeds [`MAX_SAMPLES_PER_BATCH`].
     TooLarge,
     /// Two signals in one message resolve to the same channel.
@@ -198,9 +205,21 @@ pub struct DecodeIssue {
     pub message: String,
 }
 
+/// Values of one context signal from one message: scalar JSON values
+/// (number, string or boolean) with the publisher's timestamps.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextBatch {
+    pub channel: ChannelId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    pub timestamps_unix_ns: Vec<i64>,
+    pub values: Vec<Value>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Decoded {
     pub batches: Vec<ChannelBatch>,
+    pub context: Vec<ContextBatch>,
     pub issues: Vec<DecodeIssue>,
 }
 
@@ -247,6 +266,12 @@ impl DecoderConfig {
             }
             validate_filter(&r.topic)
                 .map_err(|m| ConfigError::Invalid(format!("rule {:?}: {m}", r.name)))?;
+            if r.context_signals.iter().any(String::is_empty) {
+                return bad(format!(
+                    "rule {:?}: context signal names must be non-empty",
+                    r.name
+                ));
+            }
             let mut pointers: Vec<&str> = vec![&r.timestamps];
             pointers.extend(r.groups.as_deref());
             match &r.signals {
@@ -314,6 +339,7 @@ impl DecoderConfig {
             Err(e) => {
                 return Some(Decoded {
                     batches: vec![],
+                    context: vec![],
                     issues: vec![issue(
                         IssueKind::NotJson,
                         None,
@@ -331,6 +357,7 @@ impl DecoderConfig {
         let Some(rule) = self.rule_for(topic) else {
             return Decoded {
                 batches: vec![],
+                context: vec![],
                 issues: vec![issue(
                     IssueKind::NoMatchingRule,
                     None,
@@ -403,11 +430,12 @@ impl Rule {
         let mut seen = std::collections::BTreeSet::new();
         for (gi, g) in groups.into_iter().enumerate() {
             match self.decode_group(topic, &root, g, &source) {
-                Ok(batches) => {
+                Ok((batches, context)) => {
                     let mut dup = None;
-                    for b in &batches {
-                        if !seen.insert(b.channel.clone()) {
-                            dup = Some(b.channel.clone());
+                    let ids = batches.iter().map(|b| &b.channel);
+                    for c in ids.chain(context.iter().map(|b| &b.channel)) {
+                        if !seen.insert(c.clone()) {
+                            dup = Some(c.clone());
                             break;
                         }
                     }
@@ -427,6 +455,7 @@ impl Rule {
                         });
                     } else {
                         out.batches.extend(batches);
+                        out.context.extend(context);
                     }
                 }
                 Err(mut e) => {
@@ -444,7 +473,7 @@ impl Rule {
         root: &Value,
         g: &Value,
         source: &str,
-    ) -> Result<Vec<ChannelBatch>, Box<DecodeIssue>> {
+    ) -> Result<(Vec<ChannelBatch>, Vec<ContextBatch>), Box<DecodeIssue>> {
         let fail = |kind, signal: Option<&str>, idx: Option<usize>, m: String| {
             Box::new(DecodeIssue {
                 signal: signal.map(str::to_string),
@@ -528,6 +557,7 @@ impl Rule {
                 .collect(),
         };
         let mut batches = Vec::with_capacity(signals.len());
+        let mut context = Vec::new();
         for (name, v) in signals {
             let Some(Value::Array(vals)) = v else {
                 return Err(fail(
@@ -551,6 +581,37 @@ impl Rule {
                         timestamps.len()
                     ),
                 ));
+            }
+            let channel = ChannelId {
+                source: source.to_string(),
+                group: group.clone(),
+                signal: name.to_string(),
+            };
+            if self.context_signals.iter().any(|c| c == name) {
+                for (i, x) in vals.iter().enumerate() {
+                    let ok = match x {
+                        Value::Number(_) | Value::Bool(_) => true,
+                        Value::String(s) => s.len() <= 1024,
+                        _ => false,
+                    };
+                    if !ok {
+                        return Err(fail(
+                            IssueKind::BadContextValue,
+                            Some(name),
+                            Some(i),
+                            format!(
+                                "context signal {name:?} value {x} is not a number, boolean or string of at most 1024 bytes"
+                            ),
+                        ));
+                    }
+                }
+                context.push(ContextBatch {
+                    channel,
+                    unit: self.units.get(name).cloned(),
+                    timestamps_unix_ns: timestamps.clone(),
+                    values: vals.clone(),
+                });
+                continue;
             }
             let unit = match self.units.get(name).or(self.default_unit.as_ref()) {
                 Some(u) => u.clone(),
@@ -580,18 +641,14 @@ impl Rule {
                 }
             }
             batches.push(ChannelBatch {
-                channel: ChannelId {
-                    source: source.to_string(),
-                    group: group.clone(),
-                    signal: name.to_string(),
-                },
+                channel,
                 unit,
                 metadata: self.metadata.clone(),
                 timestamps_unix_ns: timestamps.clone(),
                 values,
             });
         }
-        Ok(batches)
+        Ok((batches, context))
     }
 }
 
@@ -906,6 +963,41 @@ mod tests {
         assert!(base(&ok.replace("\"ns\"", "\"min\"")).is_err());
         assert!(base(&ok.replace("{\"name\"", "{\"extra\":1,\"name\"")).is_err());
         assert!(DecoderConfig::from_json(br#"{"format_version":2,"rules":[]}"#).is_err());
+    }
+
+    #[test]
+    fn context_signals_keep_scalar_values() {
+        let c = DecoderConfig::from_json(
+            br#"{"format_version":1,"rules":[{
+                "name":"ctrl","topic":"plant/+/controller","source":"{topic.1}","group":"state",
+                "timestamps":"/t","timestamp_unit":"ms","signals":{"map":"/s"},
+                "units":{"load":"%"},"context_signals":["program","tool"]}]}"#,
+        )
+        .unwrap();
+        let d = c.decode_payload(
+            "plant/m1/controller",
+            br#"{"t":[1,2],"s":{"program":[11,2011],"tool":["T1","T1"],"load":[5.5,6]}}"#,
+        );
+        assert!(d.issues.is_empty(), "{:?}", d.issues);
+        assert_eq!(d.batches.len(), 1);
+        assert_eq!(d.batches[0].channel.signal, "load");
+        assert_eq!(d.context.len(), 2);
+        let tool = d
+            .context
+            .iter()
+            .find(|b| b.channel.signal == "tool")
+            .unwrap();
+        assert_eq!(
+            tool.values,
+            vec![serde_json::json!("T1"), serde_json::json!("T1")]
+        );
+        assert_eq!(tool.unit, None);
+        let d = c.decode_payload(
+            "plant/m1/controller",
+            br#"{"t":[1],"s":{"program":[null],"tool":["T1"],"load":[1]}}"#,
+        );
+        assert!(d.batches.is_empty() && d.context.is_empty());
+        assert_eq!(d.issues[0].kind, IssueKind::BadContextValue);
     }
 
     #[test]

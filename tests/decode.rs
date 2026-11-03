@@ -253,3 +253,91 @@ fn grid_cli_reports_timing_per_channel() {
     assert_eq!(chunk["output"]["sample_count"], 400);
     assert!(chunk["output"]["values"].is_null());
 }
+
+#[test]
+fn context_timeline_is_rebuilt_exactly_from_the_spool() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sqlite");
+    let cfg_path = dir.path().join("decoder.json");
+    std::fs::write(
+        &cfg_path,
+        br#"{"format_version":1,"rules":[{"name":"ctrl","topic":"plant/+/controller",
+            "source":"{topic.1}","group":"state","timestamps":"/t","timestamp_unit":"ms",
+            "signals":{"map":"/s"},"context_signals":["program","count"]}]}"#,
+    )
+    .unwrap();
+    // Observations sampled every 100 ms; values change irregularly.
+    let msgs = [
+        r#"{"t":[0,100,200],"s":{"program":[11,11,2011],"count":[41,41,41]}}"#,
+        r#"{"t":[300,400],"s":{"program":[2011,2011],"count":[41,42]}}"#,
+        // Redelivered first message: late but consistent, no events.
+        r#"{"t":[0,100,200],"s":{"program":[11,11,2011],"count":[41,41,41]}}"#,
+        // Late contradicting observation: reported, not applied.
+        r#"{"t":[250],"s":{"program":[8054],"count":[41]}}"#,
+        r#"{"t":[500,600],"s":{"program":[8054,11],"count":[42,42]}}"#,
+    ];
+    {
+        let mut spool = Spool::open(&path, MAX_DB).unwrap();
+        for m in msgs {
+            spool
+                .append(&mqtt_event("plant/m1/controller", m.as_bytes()), None)
+                .unwrap();
+        }
+    }
+    let run_once = || {
+        let out = run(
+            &path,
+            &["context", "--config", cfg_path.to_str().unwrap()],
+            None,
+        );
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let first = run_once();
+    assert_eq!(first, run_once(), "deterministic rebuild from the spool");
+    let lines: Vec<serde_json::Value> = first
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let changes: Vec<(String, i64, serde_json::Value)> = lines
+        .iter()
+        .filter(|l| l["output"]["type"] == "change")
+        .map(|l| {
+            let o = &l["output"];
+            (
+                o["channel"]["signal"].as_str().unwrap().to_string(),
+                o["unix_ns"].as_i64().unwrap(),
+                o["value"].clone(),
+            )
+        })
+        .collect();
+    let ms = 1_000_000;
+    assert_eq!(
+        changes,
+        vec![
+            ("count".into(), 0, 41.into()),
+            ("program".into(), 0, 11.into()),
+            ("program".into(), 200 * ms, 2011.into()),
+            ("count".into(), 400 * ms, 42.into()),
+            ("program".into(), 500 * ms, 8054.into()),
+            ("program".into(), 600 * ms, 11.into()),
+        ]
+    );
+    let issues: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|l| l["output"]["type"] == "issue")
+        .collect();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["output"]["kind"], "late_conflict");
+    assert_eq!(issues[0]["output"]["value_in_effect"], 2011);
+    let summary = lines.last().unwrap();
+    let prog = summary["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["channel"]["signal"] == "program")
+        .unwrap();
+    assert_eq!(prog["report"]["changes"], 4);
+    assert_eq!(prog["report"]["late_consistent"], 3);
+    assert_eq!(prog["report"]["late_conflicts"], 1);
+}

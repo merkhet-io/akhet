@@ -195,6 +195,30 @@ missing samples in gaps, maximum and RMS reconstruction error, and
 The grid state of a channel is serializable so a replay sink can persist it
 atomically with its checkpoint. Clock drift of the source is not corrected; it
 shows up as growing deviation and, beyond the tolerance, as splits.
+### Context timelines (read-only)
+
+Controller signals such as program number, tool, part count or feed override
+change irregularly and are not waveforms. List them in a rule's
+`context_signals`; their values may be numbers, strings (up to 1024 bytes) or
+booleans and need no unit (`bad_context_value` otherwise).
+
+`akhet context --config <file>` turns their observations into change events
+with last-value-held semantics, printed as JSON lines with a summary per
+channel:
+
+- Repeated observations of the value in effect produce no event.
+- A newer observation with a different value is a change event with the
+  publisher timestamp (`clock: "source"`), the collector timestamp of the
+  message (`collected_unix_ns`) and the previous value.
+- A late or out-of-order observation never rewrites the timeline: if it agrees
+  with the value in effect at its time it is counted as `late_consistent`
+  (this absorbs redelivered messages); otherwise it is a `late_conflict` issue,
+  or `late_unknown` when it predates the retained history (4096 changes per
+  channel).
+
+The timeline is a deterministic function of the spooled records in order, so
+it can be rebuilt exactly from the spool. Values compare as JSON values (`1`
+and `1.0` differ).
 
 ## Delivery semantics
 
@@ -373,7 +397,8 @@ exception and reconnect with explicit failed observations; concurrent-replayer
 exclusion and sink binding; TLS with a trusted and an untrusted CA; payload
 decoding of multi-group batches (bit-exact values) and explicit issues for
 malformed payloads; grid placement with jitter, gaps, duplicates, conflicts,
-out-of-order samples, rate estimation and rate changes.
+out-of-order samples, rate estimation and rate changes; context timelines with repeated values, redelivered and
+late contradicting observations, rebuilt identically from the spool.
 
 Against an external broker (CI runs this with Mosquitto 2):
 
