@@ -77,8 +77,20 @@ pub struct TestReceiver {
 
 impl TestReceiver {
     pub fn start(db: &Path) -> TestReceiver {
+        Self::start_with(db, true)
+    }
+
+    /// Receiver that does not advertise or serve the `batch-v1` extension.
+    pub fn start_without_batch(db: &Path) -> TestReceiver {
+        Self::start_with(db, false)
+    }
+
+    fn start_with(db: &Path, batch: bool) -> TestReceiver {
         let spool = Spool::open(db, MAX_DB).unwrap();
-        let r = Receiver::bind("127.0.0.1:0", spool, Faults::none()).unwrap();
+        let mut r = Receiver::bind("127.0.0.1:0", spool, Faults::none()).unwrap();
+        if !batch {
+            r = r.without_batch();
+        }
         let url = format!("http://{}", r.local_addr().unwrap());
         let receiver_id = r.receiver_id().to_string();
         let stop = Arc::new(AtomicBool::new(false));

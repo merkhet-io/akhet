@@ -2,8 +2,12 @@
 //! observations. See README.md for delivery semantics and limits.
 
 pub mod adapters;
+pub mod context;
+pub mod decode;
 pub mod event;
 pub mod faults;
+pub mod morlet;
 pub mod receiver;
 pub mod replay;
 pub mod spool;
+pub mod timing;

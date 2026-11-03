@@ -47,6 +47,7 @@ fn mqtt_ev(i: u64, len: usize) -> Event {
             broker: "127.0.0.1:1883".into(),
             client_id: "soak".into(),
             subscription: "s/#".into(),
+            subscriptions: vec!["s/#".into()],
             topic: format!("s/{i}"),
             qos: 1,
             retain: false,

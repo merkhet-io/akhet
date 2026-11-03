@@ -14,12 +14,19 @@ use std::time::Duration;
 
 /// Named points where faults can be injected.
 pub mod point {
-    /// MQTT message received, before the spool transaction starts.
+    /// MQTT batch (one or more messages) taken from the queue, before its
+    /// spool transaction starts.
     pub const MQTT_BEFORE_COMMIT: &str = "mqtt.before_commit";
-    /// Spool append committed, before the MQTT acknowledgment is queued.
+    /// MQTT batch transaction committed, before any of its acknowledgments
+    /// is queued.
     pub const MQTT_AFTER_COMMIT: &str = "mqtt.after_commit";
-    /// Before each spool commit in a collector (delay to simulate slow disks).
+    /// Before each spool transaction in a collector, once per transaction
+    /// (delay to simulate slow disks).
     pub const COLLECTOR_COMMIT: &str = "collector.commit";
+    /// Inside a group-commit transaction: the second event of the batch has
+    /// been inserted, the transaction is not yet committed (only reached by
+    /// batches of two or more events).
+    pub const COLLECTOR_BATCH_PARTIAL: &str = "collector.batch_partial";
     /// Modbus observation committed.
     pub const MODBUS_AFTER_COMMIT: &str = "modbus.after_commit";
     /// Replay: HTTP request about to be sent.
@@ -32,7 +39,8 @@ pub mod point {
     pub const PRUNE_BEFORE_COMMIT: &str = "prune.before_commit";
     /// Prune: a delete batch committed.
     pub const PRUNE_AFTER_COMMIT: &str = "prune.after_commit";
-    /// Receiver: event committed, response not yet sent.
+    /// Receiver: event (or batch with at least one new event) committed,
+    /// response not yet sent.
     pub const RECEIVER_AFTER_COMMIT: &str = "receiver.after_commit";
 }
 

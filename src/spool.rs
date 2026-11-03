@@ -1,8 +1,9 @@
 //! Durable local spool on SQLite.
 //!
-//! Durability model: every append is one explicit `BEGIN IMMEDIATE` ...
-//! `COMMIT` transaction with `journal_mode=DELETE`, `synchronous=FULL` and
-//! (on macOS) `fullfsync=ON`. When `append` returns `Ok`, SQLite has asked the
+//! Durability model: every append (a single event, or a group of events with
+//! [`Spool::append_batch`]) is one explicit `BEGIN IMMEDIATE` ... `COMMIT`
+//! transaction with `journal_mode=DELETE`, `synchronous=FULL` and
+//! (on macOS) `fullfsync=ON`. When an append returns `Ok`, SQLite has asked the
 //! OS to flush the rollback journal and database file to stable storage. Whether
 //! the data survives a power failure depends on the filesystem and device
 //! honoring those flushes; this has not been power-failure tested.
@@ -425,76 +426,80 @@ impl Spool {
         body: &[u8],
         source: Option<&SourceClaim>,
     ) -> Result<AppendOutcome> {
-        if body.len() > self.max_event_bytes {
-            return Err(SpoolError::EventTooLarge {
-                size: body.len(),
-                max: self.max_event_bytes,
-            });
-        }
-        let event_id = event::check_body(body)?;
-        let format_version = event::EVENT_FORMAT_VERSION;
-        let digest = event::sha256(body);
-        let res = (|| -> Result<AppendOutcome> {
+        let item = [BatchItem { body, source }];
+        let mut results = self.append_batch(&item, ItemErrors::StopAtFirst)?;
+        results.pop().expect("one result per attempted item")
+    }
+
+    /// Append several encoded event bodies in ONE transaction (group commit).
+    ///
+    /// Each item gets exactly the checks and dedup/conflict semantics of
+    /// [`Spool::append_body`], applied in order and seeing the items inserted
+    /// before it in the same batch. Returns only after the transaction
+    /// committed (outer `Ok`) or rolled back (outer `Err`: SQLite, I/O or
+    /// capacity failure, nothing from the batch is stored).
+    ///
+    /// Item-level failures (size limit, invalid format, conflicting identity)
+    /// insert nothing for that item and are reported in the inner `Result`.
+    /// With [`ItemErrors::StopAtFirst`] the items before the first failure are
+    /// committed, later items are not attempted and the returned vector ends
+    /// with that failure. With [`ItemErrors::Independent`] every item is
+    /// attempted and the vector has one entry per item.
+    pub fn append_batch(
+        &mut self,
+        items: &[BatchItem<'_>],
+        policy: ItemErrors,
+    ) -> Result<Vec<Result<AppendOutcome>>> {
+        self.append_batch_observed(items, policy, |_| {})
+    }
+
+    /// [`Spool::append_batch`] with a callback after each inserted row, before
+    /// the commit (fault injection for crash tests).
+    #[doc(hidden)]
+    pub fn append_batch_observed(
+        &mut self,
+        items: &[BatchItem<'_>],
+        policy: ItemErrors,
+        mut after_insert: impl FnMut(usize),
+    ) -> Result<Vec<Result<AppendOutcome>>> {
+        let max_event_bytes = self.max_event_bytes;
+        let res = (|| -> Result<Vec<Result<AppendOutcome>>> {
             let tx =
                 rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-            let existing: Option<(i64, Vec<u8>)> = tx
-                .query_row(
-                    "SELECT seq, body_sha256 FROM events WHERE event_id=?1",
-                    [&event_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            if let Some((seq, sha)) = existing {
-                if sha == digest {
-                    return Ok(AppendOutcome::DuplicateEvent { seq });
-                }
-                return Err(SpoolError::Conflict {
-                    what: "event_id",
-                    id: event_id,
-                    existing_seq: seq,
-                });
-            }
-            if let Some(src) = source {
-                let existing: Option<(i64, Option<Vec<u8>>)> = tx
-                    .query_row(
-                        "SELECT seq, source_sha256 FROM events WHERE source_key=?1",
-                        [&src.key],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?;
-                if let Some((seq, sha)) = existing {
-                    if sha.as_deref() == Some(&src.content_sha256[..]) {
-                        return Ok(AppendOutcome::DuplicateSource { seq });
+            let mut out = Vec::with_capacity(items.len());
+            let mut inserted = 0;
+            for item in items {
+                // Item-level errors are detected before the INSERT, so a
+                // failed item leaves nothing behind in the transaction.
+                match append_in_tx(&tx, max_event_bytes, item) {
+                    Ok(o) => {
+                        if matches!(o, AppendOutcome::Inserted { .. }) {
+                            after_insert(inserted);
+                            inserted += 1;
+                        }
+                        out.push(Ok(o));
                     }
-                    return Err(SpoolError::Conflict {
-                        what: "source identity",
-                        id: src.key.clone(),
-                        existing_seq: seq,
-                    });
+                    Err(e @ (SpoolError::Sqlite(_) | SpoolError::Io(_))) => return Err(e),
+                    Err(e) => {
+                        out.push(Err(e));
+                        if policy == ItemErrors::StopAtFirst {
+                            break;
+                        }
+                    }
                 }
             }
-            tx.execute(
-                "INSERT INTO events(event_id, format_version, source_key, source_sha256, body, body_sha256, appended_unix_ns)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    event_id,
-                    format_version,
-                    source.map(|s| s.key.as_str()),
-                    source.map(|s| &s.content_sha256[..]),
-                    body,
-                    &digest[..],
-                    event::now_unix_ns()
-                ],
-            )?;
-            let seq = tx.last_insert_rowid();
             tx.commit()?;
-            Ok(AppendOutcome::Inserted { seq })
+            Ok(out)
         })();
         let res = res.map_err(|e| match e {
             SpoolError::Sqlite(e) => self.map_full(e),
             other => other,
         });
-        if let Ok(AppendOutcome::Inserted { .. }) = res {
+        if let Ok(items) = &res
+            && items
+                .iter()
+                .any(|r| matches!(r, Ok(AppendOutcome::Inserted { .. })))
+        {
             self.note_capacity();
         }
         res
@@ -885,11 +890,114 @@ impl Spool {
         Ok(n)
     }
 
+    /// Read a value from the spool's `meta` table (collector bookkeeping, not
+    /// events; never replayed).
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Durably insert or replace a value in the `meta` table (one autocommit
+    /// transaction, same synchronous settings as appends).
+    pub fn meta_set(&mut self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )
+            .map_err(|e| self.map_full(e))?;
+        Ok(())
+    }
+
     /// Direct access for tests and fault injection.
     #[doc(hidden)]
     pub fn connection(&self) -> &Connection {
         &self.conn
     }
+}
+
+/// One item of [`Spool::append_batch`].
+#[derive(Debug, Clone, Copy)]
+pub struct BatchItem<'a> {
+    /// Encoded event body (stored byte-exact).
+    pub body: &'a [u8],
+    pub source: Option<&'a SourceClaim>,
+}
+
+/// How [`Spool::append_batch`] continues after an item-level failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemErrors {
+    /// Commit the items before the first failure; do not attempt later ones.
+    StopAtFirst,
+    /// Attempt every item; commit all that succeeded.
+    Independent,
+}
+
+/// Checks and dedup for one event inside an open write transaction.
+fn append_in_tx(
+    tx: &Connection,
+    max_event_bytes: usize,
+    item: &BatchItem<'_>,
+) -> Result<AppendOutcome> {
+    let BatchItem { body, source } = *item;
+    if body.len() > max_event_bytes {
+        return Err(SpoolError::EventTooLarge {
+            size: body.len(),
+            max: max_event_bytes,
+        });
+    }
+    let event_id = event::check_body(body)?;
+    let format_version = event::EVENT_FORMAT_VERSION;
+    let digest = event::sha256(body);
+    let existing: Option<(i64, Vec<u8>)> = tx
+        .prepare_cached("SELECT seq, body_sha256 FROM events WHERE event_id=?1")?
+        .query_row([&event_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    if let Some((seq, sha)) = existing {
+        if sha == digest {
+            return Ok(AppendOutcome::DuplicateEvent { seq });
+        }
+        return Err(SpoolError::Conflict {
+            what: "event_id",
+            id: event_id,
+            existing_seq: seq,
+        });
+    }
+    if let Some(src) = source {
+        let existing: Option<(i64, Option<Vec<u8>>)> = tx
+            .prepare_cached("SELECT seq, source_sha256 FROM events WHERE source_key=?1")?
+            .query_row([&src.key], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        if let Some((seq, sha)) = existing {
+            if sha.as_deref() == Some(&src.content_sha256[..]) {
+                return Ok(AppendOutcome::DuplicateSource { seq });
+            }
+            return Err(SpoolError::Conflict {
+                what: "source identity",
+                id: src.key.clone(),
+                existing_seq: seq,
+            });
+        }
+    }
+    tx.prepare_cached(
+        "INSERT INTO events(event_id, format_version, source_key, source_sha256, body, body_sha256, appended_unix_ns)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+    )?
+    .execute(params![
+        event_id,
+        format_version,
+        source.map(|s| s.key.as_str()),
+        source.map(|s| &s.content_sha256[..]),
+        body,
+        &digest[..],
+        event::now_unix_ns()
+    ])?;
+    Ok(AppendOutcome::Inserted {
+        seq: tx.last_insert_rowid(),
+    })
 }
 
 fn verify_row(
