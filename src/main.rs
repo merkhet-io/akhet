@@ -131,6 +131,47 @@ enum Command {
         #[arg(long)]
         limit: Option<u64>,
     },
+    /// Replay decoded samples and context into MorletDB (PostgreSQL with
+    /// pg_morlet). The connection string is read from AKHET_MORLET_URL only.
+    Morlet {
+        /// Sink name; its checkpoint is bound to the database identity.
+        #[arg(long)]
+        sink: String,
+        /// Stream collection (`table` or `schema.table`).
+        #[arg(long)]
+        collection: String,
+        /// Create the collection and its context tables if missing.
+        #[arg(long)]
+        create_collection: bool,
+        /// Decoder config file (JSON) with timing and context_signals.
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        records_per_tx: usize,
+        /// Feature extractor for new recordings (`none` stores raw only).
+        #[arg(long, default_value = "none")]
+        extractor: String,
+        #[arg(long, default_value_t = 512)]
+        window_size: i32,
+        #[arg(long, default_value_t = 256)]
+        stride: i32,
+        #[arg(long, default_value = "zscore")]
+        normalization: String,
+        /// Storage hint for the lossless chunk codec (see MorletDB docs).
+        #[arg(long, default_value_t = 1.0)]
+        sample_quantum: f64,
+        #[arg(long, default_value_t = 8)]
+        max_attempts: u32,
+        #[arg(long, default_value_t = 30_000)]
+        max_backoff_ms: u64,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long, default_value_t = 1000)]
+        follow_interval_ms: u64,
+        /// Stop after this many spool records.
+        #[arg(long)]
+        limit: Option<u64>,
+    },
     /// Show spool size, limits, record counts and sink checkpoints.
     Status,
     /// Print records as JSON lines (verifies checksums while reading).
@@ -388,6 +429,75 @@ fn main() -> ExitCode {
                         ReplayError::Locked { .. } => exit::LOCKED,
                         ReplayError::Rejected { .. } | ReplayError::Protocol(_) => exit::REJECTED,
                         ReplayError::Unavailable { .. } => exit::UNAVAILABLE,
+                        _ => exit::ERROR,
+                    };
+                    fail(code, e)
+                }
+            }
+        }
+        Command::Morlet {
+            sink,
+            collection,
+            create_collection,
+            config,
+            records_per_tx,
+            extractor,
+            window_size,
+            stride,
+            normalization,
+            sample_quantum,
+            max_attempts,
+            max_backoff_ms,
+            follow,
+            follow_interval_ms,
+            limit,
+        } => {
+            let decoder = match akhet::decode::DecoderConfig::load(&config) {
+                Ok(c) => c,
+                Err(e) => return fail(2, e),
+            };
+            let Some(url) = std::env::var("AKHET_MORLET_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+            else {
+                return fail(
+                    2,
+                    "AKHET_MORLET_URL is not set (PostgreSQL connection string)",
+                );
+            };
+            let mut cfg = akhet::morlet::MorletConfig::new(&url, &sink, &collection, decoder);
+            cfg.create_collection = create_collection;
+            cfg.records_per_tx = records_per_tx;
+            cfg.extractor = extractor;
+            cfg.window_size = window_size;
+            cfg.stride = stride;
+            cfg.normalization = normalization;
+            cfg.sample_quantum = sample_quantum;
+            cfg.max_attempts = max_attempts;
+            cfg.backoff_max = Duration::from_millis(max_backoff_ms);
+            cfg.follow = follow.then(|| Duration::from_millis(follow_interval_ms));
+            cfg.limit = limit;
+            let path = cli.spool.clone();
+            let max = cli.max_db_bytes;
+            let f2 = flag.clone();
+            // The synchronous PostgreSQL client runs its own runtime: use a
+            // plain thread, not the tokio blocking pool.
+            let res =
+                std::thread::spawn(move || akhet::morlet::run(&path, max, &cfg, &faults, &f2))
+                    .join();
+            match res {
+                Err(_) => fail(exit::ERROR, "morlet sink thread panicked"),
+                Ok(Ok(summary)) => {
+                    print_json(&summary);
+                    ExitCode::SUCCESS
+                }
+                Ok(Err(e)) => {
+                    let code = match &e {
+                        ReplayError::Spool(s) => spool_exit(s),
+                        ReplayError::Locked { .. } => exit::LOCKED,
+                        ReplayError::Rejected { .. } | ReplayError::Protocol(_) => exit::REJECTED,
+                        ReplayError::Unavailable { .. } => exit::UNAVAILABLE,
+                        ReplayError::Config(_) => 2,
                         _ => exit::ERROR,
                     };
                     fail(code, e)
