@@ -1,0 +1,2 @@
+cargo:rustc-check-cfg=cfg(native_stack_guard)
+cargo:rustc-cfg=native_stack_guard

@@ -1,0 +1,10 @@
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/untrusted-85294d26c7456858.d: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/input.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/no_panic.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/reader.rs
+
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/libuntrusted-85294d26c7456858.rlib: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/input.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/no_panic.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/reader.rs
+
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/libuntrusted-85294d26c7456858.rmeta: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/input.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/no_panic.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/reader.rs
+
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/lib.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/input.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/no_panic.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/untrusted-0.9.0/src/reader.rs:

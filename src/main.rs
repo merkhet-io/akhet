@@ -214,6 +214,19 @@ enum Command {
         /// Create the collection and its context tables if missing.
         #[arg(long)]
         create_collection: bool,
+        /// Do not register recordings as MorletDB acquisition channels.
+        #[arg(long)]
+        no_acquisitions: bool,
+        /// Context key whose change starts a new acquisition of the source
+        /// (repeatable or comma-separated, e.g. `--acquisition-context
+        /// program`).
+        #[arg(long, value_delimiter = ',')]
+        acquisition_context: Vec<String>,
+        /// Maximum acquisition duration in seconds: acquisitions end at
+        /// multiples of it since the Unix epoch (86400: UTC midnight).
+        /// 0: no limit.
+        #[arg(long, default_value_t = 86_400)]
+        acquisition_period_s: u64,
         /// Decoder config file (JSON) with timing and context_signals.
         #[arg(long)]
         config: PathBuf,
@@ -635,6 +648,9 @@ fn main() -> ExitCode {
             sink,
             collection,
             create_collection,
+            no_acquisitions,
+            acquisition_context,
+            acquisition_period_s,
             config,
             records_per_tx,
             extractor,
@@ -663,6 +679,9 @@ fn main() -> ExitCode {
             };
             let mut cfg = akhet::morlet::MorletConfig::new(&url, &sink, &collection, decoder);
             cfg.create_collection = create_collection;
+            cfg.acquisitions = !no_acquisitions;
+            cfg.acquisition_context = acquisition_context;
+            cfg.acquisition_period_s = (acquisition_period_s > 0).then_some(acquisition_period_s);
             cfg.records_per_tx = records_per_tx;
             cfg.extractor = extractor;
             cfg.window_size = window_size;

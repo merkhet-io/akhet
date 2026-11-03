@@ -240,3 +240,37 @@ window is full), 20 records per transaction, 6 transactions, extractor
 - Per-channel state rows (the issue's second proposal) were not needed:
   every active channel changes in every transaction, so it would not reduce
   the bytes written.
+
+### Acquisition reads on a source with many gaps (#25)
+
+`examples/morlet_acquisition.rs`: one source with 4 channels × 1 kHz, 100
+samples per message. Every second message is missing for all channels (a
+device pause), so G gaps after 2G messages. The sink runs with its
+defaults; then the last `--window-ms` of data is read with
+`morlet_read_acquisition`, one call per acquisition that overlaps the
+window. Time per window read is the median of 30. `SELECT 1` takes about
+0.6–0.9 ms on this setup (Docker Desktop, as above).
+
+- **Before:** one acquisition per source, a new `@anchor` channel for every
+  recording.
+- **After:** bounded acquisitions, cut at every discontinuity, with one
+  recording per role.
+
+| gaps | before: channels in the acquisition | after: acquisitions | 1 s window (2 000 samples), before | after (6 calls) | 100 ms window (400 samples), before | after (2 calls) |
+|---|---|---|---|---|---|---|
+| 10 | 40 | 10 | 2.9 ms | 7.7 ms | 1.7 ms | 3.3 ms |
+| 100 | 400 | 100 | 6.9 ms | 8.5 ms | 4.8 ms | 2.8 ms |
+| 1 000 | 4 000 | 1 000 | 42.9 ms | 9.4 ms | 41.6 ms | 2.9 ms |
+
+- **Before:** `morlet_read_acquisition` visits every channel of the
+  acquisition, so read time grew with the source's history: about 15× from
+  10 to 1 000 gaps for the same samples. `morlet_compare_acquisition`
+  iterates the same channel list.
+- **After:** read time does not depend on how long the source has run;
+  each call visits 4 channels.
+  - A window that crosses boundaries needs one call per acquisition. With
+    a gap every 200 ms, as here, a 1 s window spans 6 runs, which makes
+    it slower than before for short histories, mostly in round trips.
+  - Real sources have far fewer boundaries per window. Gaps every 200 ms
+    are a stress case.
+- Sink time is unchanged within noise (19–20 s for 1 000 gaps in both).

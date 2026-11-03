@@ -1,0 +1,9 @@
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/signal_hook_registry-4fb816254f74f6a0.d: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/libsignal_hook_registry-4fb816254f74f6a0.rlib: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/libsignal_hook_registry-4fb816254f74f6a0.rmeta: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs:

@@ -157,6 +157,11 @@ pub struct RecordingStart {
     pub tolerance_ns: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discontinuity: Option<Discontinuity>,
+    /// Set when the recording was started by a requested cut
+    /// ([`ChannelGrid::cut_at`]): the boundary that caused it. The previous
+    /// recording ended on the same grid, without missing samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_at_unix_ns: Option<i64>,
 }
 
 /// Timing evidence for one chunk.
@@ -224,6 +229,9 @@ pub struct GridReport {
     pub splits_gap: u64,
     pub splits_off_grid: u64,
     pub splits_rate_change: u64,
+    /// Recordings ended by a requested cut (`cut_at`), not by the data.
+    #[serde(default)]
+    pub splits_cut: u64,
     pub missing_samples_in_gaps: u64,
     /// Largest |original - reconstructed| timestamp over all placed samples.
     pub max_reconstruction_error_ns: f64,
@@ -240,6 +248,8 @@ struct Active {
     key: String,
     anchor: i64,
     rate_hz: f64,
+    #[serde(default)]
+    rate_estimated: bool,
     period_ns: f64,
     tol_ns: f64,
     next: u64,
@@ -293,6 +303,9 @@ pub struct ChannelGrid {
     last_seen: Option<i64>,
     last_rate: Option<f64>,
     report: GridReport,
+    /// Requested cut times, ascending (see `cut_at`).
+    #[serde(default)]
+    cuts: Vec<i64>,
     /// Chunks completed mid-batch (above `max_chunk_samples`), emitted at
     /// the next flush. Always empty between calls.
     #[serde(skip)]
@@ -316,12 +329,34 @@ impl ChannelGrid {
             last_seen: None,
             last_rate: None,
             report: GridReport::default(),
+            cuts: Vec::new(),
             overflow: Vec::new(),
         })
     }
 
     pub fn report(&self) -> &GridReport {
         &self.report
+    }
+
+    /// Request a recording boundary at `unix_ns`: if the recording active at
+    /// the first sample at or after `unix_ns` started before it, that
+    /// recording ends and a new one starts at that sample, on the same grid
+    /// (same rate, no samples lost or repeated). A consumer uses this to cut
+    /// several channels at a common boundary. If the channel has already
+    /// placed samples beyond `unix_ns`, the cut happens at its next sample.
+    /// A discontinuity at that sample also satisfies the cut.
+    pub fn cut_at(&mut self, unix_ns: i64) {
+        if let Err(i) = self.cuts.binary_search(&unix_ns) {
+            self.cuts.insert(i, unix_ns);
+        }
+    }
+
+    /// Remove requested cuts at or before `t`; the latest of them.
+    fn take_cut(&mut self, t: i64) -> Option<i64> {
+        let n = self.cuts.partition_point(|&c| c <= t);
+        let last = n.checked_sub(1).map(|i| self.cuts[i]);
+        self.cuts.drain(..n);
+        last
     }
 
     /// The duplicate-detection window: the last `dedup_window_samples`
@@ -411,8 +446,13 @@ impl ChannelGrid {
         }
         self.last_seen = Some(t);
         if self.active.is_some() {
-            self.place(t, v, out);
+            let cut = self.take_cut(t);
+            self.place(t, v, cut, out);
             return;
+        }
+        if self.pending.is_none() {
+            // A new recording starts at t anyway.
+            self.take_cut(t);
         }
         let discontinuity = self.pending.as_mut().and_then(|p| p.discontinuity.take());
         self.begin(t, v, discontinuity, out);
@@ -428,7 +468,7 @@ impl ChannelGrid {
         out: &mut Vec<GridOutput>,
     ) {
         if let Some(rate) = self.spec.rate_hz {
-            self.start(t, rate, false, discontinuity, out);
+            self.start(t, rate, false, discontinuity, None, out);
             self.accept(t, v, 0.0);
             return;
         }
@@ -465,11 +505,13 @@ impl ChannelGrid {
             self.report.splits_rate_change += 1;
         }
         let (t0, v0) = p.samples[0];
-        self.start(t0, rate, true, disc, out);
+        self.take_cut(t0);
+        self.start(t0, rate, true, disc, None, out);
         self.accept(t0, v0, 0.0);
         for &(t, v) in &p.samples[1..] {
             if self.active.is_some() {
-                self.place(t, v, out);
+                let cut = self.take_cut(t);
+                self.place(t, v, cut, out);
             } else {
                 // A split inside the held samples: keep estimating from there.
                 let d = self.pending.as_mut().and_then(|p| p.discontinuity.take());
@@ -484,6 +526,7 @@ impl ChannelGrid {
         rate: f64,
         estimated: bool,
         discontinuity: Option<Discontinuity>,
+        cut: Option<i64>,
         out: &mut Vec<GridOutput>,
     ) {
         let period_ns = 1e9 / rate;
@@ -497,12 +540,14 @@ impl ChannelGrid {
             rate_estimated: estimated,
             tolerance_ns: tol,
             discontinuity,
+            cut_at_unix_ns: cut,
         }));
         self.last_rate = Some(rate);
         self.active = Some(Active {
             key,
             anchor: t,
             rate_hz: rate,
+            rate_estimated: estimated,
             period_ns,
             tol_ns: tol,
             next: 0,
@@ -510,11 +555,24 @@ impl ChannelGrid {
         });
     }
 
-    fn place(&mut self, t: i64, v: f64, out: &mut Vec<GridOutput>) {
+    /// Place a sample after the active recording; `cut` is a requested cut
+    /// at or before `t` (from `take_cut`).
+    fn place(&mut self, t: i64, v: f64, cut: Option<i64>, out: &mut Vec<GridOutput>) {
         let a = self.active.as_ref().expect("active recording");
         let dev = (t - ideal(a.anchor, a.period_ns, a.next)) as f64;
         if dev.abs() <= a.tol_ns {
-            self.accept(t, v, dev);
+            match cut {
+                Some(c) if a.anchor < c => {
+                    // Requested boundary: continue on the same grid in a new
+                    // recording starting at this sample.
+                    let (rate, est) = (a.rate_hz, a.rate_estimated);
+                    self.report.splits_cut += 1;
+                    self.end_active(out);
+                    self.start(t, rate, est, None, Some(c), out);
+                    self.accept(t, v, 0.0);
+                }
+                _ => self.accept(t, v, dev),
+            }
             return;
         }
         let m = ((t - a.anchor) as f64 / a.period_ns).round();
@@ -673,6 +731,93 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// (recording, start sample, values) of every chunk.
+    fn placed(o: &[GridOutput]) -> Vec<(String, u64, Vec<f64>)> {
+        chunks(o)
+            .into_iter()
+            .map(|c| (c.recording.clone(), c.start_sample, c.values.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn requested_cut_starts_a_new_recording_on_the_same_grid() {
+        // 1 kHz, 1 ms period; samples at 0..10 ms.
+        let ts: Vec<i64> = (0..10).map(|k| k * 1_000_000).collect();
+        let vs: Vec<f64> = (0..10).map(|k| k as f64).collect();
+        let mut g = fixed(1000.0, 1000);
+        let mut o = g.push(&ts[..3], &vs[..3]);
+        g.cut_at(5_500_000);
+        g.cut_at(4_200_000); // the earlier of two pending cuts applies first
+        o.extend(g.push(&ts[3..], &vs[3..]));
+        let st = starts(&o);
+        assert_eq!(st.len(), 3);
+        assert_eq!(
+            st.iter()
+                .map(|s| (s.anchor_unix_ns, s.cut_at_unix_ns))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, None),
+                (5_000_000, Some(4_200_000)),
+                (6_000_000, Some(5_500_000))
+            ]
+        );
+        assert!(
+            st.iter()
+                .all(|s| s.discontinuity.is_none() && s.rate_hz == 1000.0)
+        );
+        let p = placed(&o);
+        let all: Vec<f64> = p.iter().flat_map(|(_, _, v)| v.clone()).collect();
+        assert_eq!(all, vs, "nothing lost or repeated");
+        assert_eq!(p[0].1, 0);
+        assert!(
+            p.iter()
+                .filter(|(r, _, _)| r.ends_with("@6000000"))
+                .all(|(_, s, _)| *s == 0)
+        );
+        assert_eq!(g.report().splits_cut, 2);
+        assert_eq!(g.report().splits_gap, 0);
+    }
+
+    #[test]
+    fn cut_in_the_past_applies_at_the_next_sample_and_before_the_anchor_is_ignored() {
+        let mut g = fixed(1000.0, 1000);
+        let o1 = g.push(&[0, 1_000_000, 2_000_000], &[0.0, 1.0, 2.0]);
+        g.cut_at(1_500_000); // already placed beyond it
+        let o2 = g.push(&[3_000_000, 4_000_000], &[3.0, 4.0]);
+        let st = starts(&o2);
+        assert_eq!(st.len(), 1);
+        assert_eq!(
+            (st[0].anchor_unix_ns, st[0].cut_at_unix_ns),
+            (3_000_000, Some(1_500_000))
+        );
+        // A cut at or before the active recording's anchor does nothing.
+        g.cut_at(3_000_000);
+        assert!(starts(&g.push(&[5_000_000], &[5.0])).is_empty());
+        assert_eq!(starts(&o1).len(), 1);
+    }
+
+    #[test]
+    fn a_gap_at_the_cut_is_a_discontinuity_only() {
+        let mut g = fixed(1000.0, 1000);
+        g.push(&[0, 1_000_000], &[0.0, 1.0]);
+        g.cut_at(2_000_000);
+        let o = g.push(&[5_000_000], &[5.0]);
+        let st = starts(&o);
+        assert_eq!(st.len(), 1);
+        assert!(st[0].discontinuity.is_some());
+        assert_eq!(st[0].cut_at_unix_ns, None);
+        assert_eq!(g.report().splits_cut, 0);
+        // Cut state survives serialization.
+        g.cut_at(9_000_000);
+        let mut g2: ChannelGrid =
+            serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        let o = g2.push(
+            &[6_000_000, 7_000_000, 8_000_000, 9_000_000],
+            &[6.0, 7.0, 8.0, 9.0],
+        );
+        assert_eq!(starts(&o)[0].anchor_unix_ns, 9_000_000);
     }
 
     fn issues(o: &[GridOutput]) -> Vec<TimingIssueKind> {

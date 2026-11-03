@@ -1,0 +1,11 @@
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/zeroize-56629bce2b9b99a4.d: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/aarch64.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/barrier.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/stack.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/../README.md
+
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/libzeroize-56629bce2b9b99a4.rlib: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/aarch64.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/barrier.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/stack.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/../README.md
+
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/libzeroize-56629bce2b9b99a4.rmeta: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/aarch64.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/barrier.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/stack.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/../README.md
+
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/lib.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/aarch64.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/barrier.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/stack.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.1/src/../README.md:
