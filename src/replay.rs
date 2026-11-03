@@ -14,10 +14,15 @@
 //! lost response after the receiver committed causes the same event_id to be
 //! sent again; the receiver must deduplicate it. This is at-least-once delivery
 //! with receiver-side deduplication, not exactly-once.
+//!
+//! With `--follow`, replay can also prune the spool periodically
+//! ([`ReplayConfig::prune`]). Pruning uses the minimum checkpoint over *all*
+//! sinks bound in the spool, not just this one, so a lagging sink holds back
+//! deletion for every replayer.
 
 use crate::event;
 use crate::faults::{Faults, point};
-use crate::spool::{SinkRow, Spool, SpoolError};
+use crate::spool::{PruneOptions, SinkRow, Spool, SpoolError};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +44,8 @@ pub struct ReplayConfig {
     pub follow: Option<Duration>,
     /// Stop after delivering this many records.
     pub limit: Option<u64>,
+    /// Prune acknowledged records at most once per interval (follow mode).
+    pub prune: Option<(Duration, PruneOptions)>,
 }
 
 impl ReplayConfig {
@@ -53,6 +60,7 @@ impl ReplayConfig {
             backoff_max: Duration::from_secs(30),
             follow: None,
             limit: None,
+            prune: None,
         }
     }
 }
@@ -90,6 +98,8 @@ pub struct ReplaySummary {
     pub retries: u64,
     pub checkpoint_seq: i64,
     pub interrupted: bool,
+    /// Records deleted by periodic pruning during this run.
+    pub pruned_records: u64,
 }
 
 /// Exclusive per-(spool, sink) lock. Held for the lifetime of the value and
@@ -274,9 +284,36 @@ pub fn run(
     let sink: SinkRow = spool.bind_sink(&cfg.sink, &url, &receiver_id)?;
     summary.receiver_id = receiver_id;
     summary.checkpoint_seq = sink.checkpoint_seq;
+    if sink.checkpoint_seq == 0
+        && let Some(first) = spool.read_after(0, 1)?.first()
+        && first.seq > 1
+    {
+        eprintln!(
+            "akhet: replay: warning: sink {:?} starts at seq {}; records before it were pruned \
+             and will not be delivered to this sink",
+            cfg.sink, first.seq
+        );
+    }
     let events_url = format!("{url}/v1/events");
+    let mut last_prune = Instant::now();
 
     'outer: loop {
+        if let Some((interval, opts)) = &cfg.prune
+            && last_prune.elapsed() >= *interval
+        {
+            last_prune = Instant::now();
+            let r = spool.prune(opts, faults, stop)?;
+            if r.records > 0 {
+                eprintln!(
+                    "akhet: replay: pruned {} records (seq {}..={}); headroom {} pages",
+                    r.records,
+                    r.first_seq.unwrap_or(0),
+                    r.last_seq.unwrap_or(0),
+                    r.headroom_pages
+                );
+            }
+            summary.pruned_records += r.records;
+        }
         let batch = spool.read_after(summary.checkpoint_seq, cfg.batch)?;
         if batch.is_empty() {
             match cfg.follow {

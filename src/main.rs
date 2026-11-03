@@ -4,7 +4,7 @@ use akhet::adapters::{AsyncSpool, CollectError, Stop};
 use akhet::faults::Faults;
 use akhet::receiver::Receiver;
 use akhet::replay::{self, ReplayConfig, ReplayError};
-use akhet::spool::{self, Spool, SpoolError};
+use akhet::spool::{self, PruneOptions, Spool, SpoolError};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -130,6 +130,26 @@ enum Command {
         follow_interval_ms: u64,
         #[arg(long)]
         limit: Option<u64>,
+        /// With --follow: prune records acknowledged by every bound sink at
+        /// most once per this interval (e.g. 10m). Off by default.
+        #[arg(long, requires = "follow", value_parser = parse_duration)]
+        prune_interval: Option<Duration>,
+        /// Minimum record age for --prune-interval (e.g. 30m, 24h, 7d).
+        #[arg(long, default_value = "24h", value_parser = parse_duration)]
+        prune_min_age: Duration,
+    },
+    /// Delete records that every bound sink has acknowledged and that are
+    /// older than --min-age. Never deletes anything if no sink is bound.
+    Prune {
+        /// Minimum age since append (e.g. 0s, 30m, 24h, 7d).
+        #[arg(long, default_value = "24h", value_parser = parse_duration)]
+        min_age: Duration,
+        /// Report what would be deleted without deleting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Records deleted per transaction.
+        #[arg(long, default_value_t = spool::DEFAULT_PRUNE_BATCH, value_parser = parse_batch)]
+        batch_size: usize,
     },
     /// Show spool size, limits, record counts and sink checkpoints.
     Status,
@@ -311,8 +331,19 @@ fn main() -> ExitCode {
             follow,
             follow_interval_ms,
             limit,
+            prune_interval,
+            prune_min_age,
         } => {
             let mut cfg = ReplayConfig::new(&url, &sink);
+            cfg.prune = prune_interval.map(|i| {
+                (
+                    i,
+                    PruneOptions {
+                        min_age: prune_min_age,
+                        ..Default::default()
+                    },
+                )
+            });
             cfg.request_timeout = Duration::from_millis(timeout_ms);
             cfg.max_attempts = max_attempts;
             cfg.backoff_max = Duration::from_millis(max_backoff_ms);
@@ -341,6 +372,24 @@ fn main() -> ExitCode {
                     };
                     fail(code, e)
                 }
+            }
+        }
+        Command::Prune {
+            min_age,
+            dry_run,
+            batch_size,
+        } => {
+            let opts = PruneOptions {
+                min_age,
+                batch: batch_size,
+                dry_run,
+            };
+            match open().and_then(|mut s| s.prune(&opts, &faults, &flag)) {
+                Ok(report) => {
+                    print_json(&report);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(spool_exit(&e), e),
             }
         }
         Command::Status => match open().and_then(|s| s.status()) {
@@ -405,6 +454,33 @@ fn main() -> ExitCode {
     }
 }
 
+fn parse_batch(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(format!("batch size must be a positive integer, got {s:?}")),
+    }
+}
+
+/// Parse `<n>[s|m|h|d]` (no unit means seconds).
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?} (use e.g. 90s, 30m, 24h, 7d)"))?;
+    let mult = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return Err(format!("invalid duration unit in {s:?} (use s, m, h or d)")),
+    };
+    n.checked_mul(mult)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("duration {s:?} is too large"))
+}
+
 fn collect_fail(e: CollectError) -> ExitCode {
     let code = match &e {
         CollectError::Spool(s) => spool_exit(s),
@@ -412,4 +488,22 @@ fn collect_fail(e: CollectError) -> ExitCode {
         CollectError::Fatal(_) => exit::ERROR,
     };
     fail(code, e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("0s").unwrap(), Duration::ZERO);
+        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86_400));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        for bad in ["", "h", "-1s", "1.5h", "3w", "1h30m"] {
+            assert!(parse_duration(bad).is_err(), "{bad}");
+        }
+    }
 }

@@ -28,6 +28,10 @@ pub mod point {
     pub const REPLAY_AFTER_REMOTE_SUCCESS: &str = "replay.after_remote_success";
     /// Replay: local checkpoint advanced.
     pub const REPLAY_AFTER_CHECKPOINT: &str = "replay.after_checkpoint";
+    /// Prune: a batch was deleted inside its transaction, not yet committed.
+    pub const PRUNE_BEFORE_COMMIT: &str = "prune.before_commit";
+    /// Prune: a delete batch committed.
+    pub const PRUNE_AFTER_COMMIT: &str = "prune.after_commit";
     /// Receiver: event committed, response not yet sent.
     pub const RECEIVER_AFTER_COMMIT: &str = "receiver.after_commit";
 }

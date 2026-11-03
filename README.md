@@ -57,6 +57,10 @@ akhet receive --listen 127.0.0.1:8080 --db data/receiver.sqlite
 # Replay (run as often as you like; it resumes from the sink checkpoint)
 akhet --spool data/spool.sqlite replay --url http://127.0.0.1:8080 --sink local-demo
 akhet --spool data/receiver.sqlite inspect
+
+# Delete records every bound sink has acknowledged (see Retention)
+akhet --spool data/spool.sqlite prune --min-age 0s --dry-run
+akhet --spool data/spool.sqlite prune --min-age 0s
 ```
 
 `--spool` can also be set with `AKHET_SPOOL`. Collectors and replay print a
@@ -77,7 +81,7 @@ Crate layout (`src/`):
 | Module | Role |
 |---|---|
 | `event.rs` | Versioned event format (`format_version` 1), encoding, checksums |
-| `spool.rs` | SQLite spool: schema versioning, append, checksummed reads, capacity, sink checkpoints |
+| `spool.rs` | SQLite spool: schema versioning, append, checksummed reads, capacity, sink checkpoints, pruning |
 | `adapters/mqtt.rs` | MQTT 3.1.1 (rumqttc) with acknowledgment after commit |
 | `adapters/modbus.rs` | Modbus TCP holding-register polling (tokio-modbus) |
 | `adapters/mod.rs` | Blocking-pool spool handle, stop signal |
@@ -246,8 +250,64 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
   additional space. A full filesystem below the limit is reported separately
   ("filesystem full"). Pass the same `--max-db-bytes` to every command that
   writes a spool (the limit is applied per connection).
-- Retention: records are kept; this increment never deletes anything. Plan
-  disk space, or rotate spool files manually after replay.
+- Capacity warnings: appends (collectors, example receiver) log a warning to
+  stderr when page usage first crosses 80 % and 95 % of the limit (freelist
+  pages count as free; a level re-arms once usage falls 5 points below it). `status` reports
+  `used_pages`, `used_percent`, `headroom_pages`/`headroom_bytes` and
+  `freelist_count`.
+- Retention: nothing is deleted unless you run `prune` (below). Without it the
+  spool fills up and collection stops at the limit.
+
+## Retention
+
+`akhet prune` deletes records that are safe to drop and prints a JSON report
+(`records`, `first_seq`/`last_seq` deleted, `safe_seq`, `limited_by`,
+`batches`, `page_count`, `freelist_count`, `headroom_pages`).
+
+- **Only acknowledged records.** A record is eligible only if
+  `seq <= min(checkpoint_seq)` over **all** sinks bound in the spool, i.e.
+  every sink has received a 2xx for it. A sink that lags, or that was used once
+  and abandoned, holds back deletion for everyone (`status` shows each sink's
+  `pending_records` and the resulting `prune_safe_seq`). If no sink is bound,
+  nothing is ever deleted.
+- **Minimum age.** `--min-age` (default `24h`; units `s`, `m`, `h`, `d`) keeps
+  records for at least that long after they were appended, by the collector's
+  wall clock (`appended_unix_ns`). Pruning deletes a contiguous prefix: it
+  stops at the first record that is too young or above the minimum checkpoint,
+  so a backwards clock step delays deletion rather than causing it.
+- **Bounded transactions.** Records are deleted in batches of `--batch-size`
+  (default 1000), one `BEGIN IMMEDIATE … COMMIT` each, re-reading the sink
+  checkpoints inside every transaction. Collectors wait for at most one batch
+  (SQLite busy timeout 10 s). A crash rolls back only the batch in progress;
+  committed batches stay deleted. `--dry-run` reports without deleting.
+- **Space reuse, not shrinking.** Deleted pages go to SQLite's freelist and are
+  reused by later appends before the file grows, so once pruning keeps up,
+  `page_count` stays bounded and the `--max-db-bytes` limit keeps working (the
+  limit counts all pages, free or not; freelist pages count as headroom). The
+  file on disk is never shrunk: Akhet runs no `VACUUM`, because a full VACUUM
+  rewrites the whole database, needs up to twice its size in free disk space
+  and blocks collectors for its duration, and `auto_vacuum` cannot be enabled
+  on an existing spool without one. If you must shrink a file, stop all
+  collectors and replayers first and run `VACUUM` with the `sqlite3` shell.
+- **Journal space.** A delete batch writes the original pages to the rollback
+  journal, outside the database-size limit. Pruning a spool on a completely
+  full filesystem can fail; lower `--batch-size` to reduce journal size.
+- **Periodic pruning.** `replay --follow --prune-interval 10m
+  [--prune-min-age 24h]` prunes at most once per interval from the replayer,
+  using the same rules (minimum over all sinks, not just the replaying one).
+  It is off by default. Several replayers may prune the same spool
+  concurrently; each batch is serialized by SQLite.
+- **Consequences of deleting.** A sink bound *after* records were pruned starts
+  from the oldest remaining record; replay logs a warning naming the first seq
+  it will deliver. Identity deduplication (`event_id`, configured MQTT source
+  identities) only covers records still in the spool: a broker redelivery of an
+  already pruned message is stored again as a new record. Keep `--min-age`
+  longer than any plausible redelivery delay. `seq` stays monotonic after
+  deletes (`AUTOINCREMENT`); it is never reused, so checkpoints remain valid.
+- **Not implemented: segment rotation.** Records are not rotated into sealed
+  segment files. Freelist reuse with bounded delete batches already keeps the
+  file bounded without VACUUM; rotation would mainly allow returning space to
+  the filesystem and archiving segments, and is left as follow-up work.
 - Security: no encryption at rest, and no HTTP authentication or TLS in the
   example receiver. Keep spool files in an access-controlled local directory and
   bind the receiver to loopback or a trusted network.
@@ -286,7 +346,20 @@ unsupported schema and event format; capacity exhaustion; MQTT disconnects,
 redelivery and queue saturation; acknowledgments not carried across reconnects;
 graceful shutdown leaving uncommitted messages unacknowledged; Modbus timeout,
 exception and reconnect with explicit failed observations; concurrent-replayer
-exclusion and sink binding; TLS with a trusted and an untrusted CA.
+exclusion and sink binding; TLS with a trusted and an untrusted CA; pruning
+limited by the slowest sink, by the minimum age and by having no sink; reads,
+`verify`, `status` and replay after early records are gone; freelist reuse
+under the size limit after a full spool is pruned; crashes inside a prune
+transaction and between batches (`prune.before_commit`,
+`prune.after_commit`) followed by `verify`.
+
+A short bounded-size soak test appends, replays to the example receiver and
+prunes in cycles, writing several times the size limit through a 128 KiB spool
+and asserting that `page_count` stops growing. Run it longer with:
+
+```sh
+AKHET_SOAK_CYCLES=500 cargo test --locked --test retention soak -- --nocapture
+```
 
 Against an external broker (CI runs this with Mosquitto 2):
 
@@ -295,7 +368,7 @@ AKHET_TEST_BROKER_PORT=1883 cargo test --locked --test mqtt_external -- --ignore
 ```
 
 Not covered: power-failure durability, broker restarts with persistence, real
-Modbus devices, long-duration soak tests, throughput or latency benchmarks.
+Modbus devices, multi-day soak tests, throughput or latency benchmarks.
 
 ## Scope boundaries
 
@@ -304,7 +377,8 @@ Modbus devices, long-duration soak tests, throughput or latency benchmarks.
   recording identity and gaps; irregular Modbus polls are not a uniform
   waveform.
 - No ML, adaptive discarding, Parquet conversion, custom storage engine,
-  retention/deletion, fleet management or performance claims.
+  segment rotation, fleet management or performance claims. Deletion exists
+  only as the explicit, acknowledgment-gated `prune` described above.
 
 ## License
 
