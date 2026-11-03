@@ -7,6 +7,7 @@ pub mod decode;
 pub mod event;
 pub mod faults;
 pub mod morlet;
+pub mod pgtls;
 pub mod receiver;
 pub mod replay;
 pub mod spool;

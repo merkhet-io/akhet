@@ -22,6 +22,7 @@ use crate::context::{ContextOutput, ContextTracker};
 use crate::decode::DecoderConfig;
 use crate::event;
 use crate::faults::{Faults, point};
+use crate::pgtls::{PgConnect, SslMode};
 use crate::replay::{ReplayError, SinkLock};
 use crate::spool::Spool;
 use crate::timing::{ChannelGrid, GridOutput};
@@ -88,6 +89,8 @@ impl MorletConfig {
 pub struct MorletSummary {
     pub sink: String,
     pub destination: String,
+    /// Effective `sslmode` of the database connection.
+    pub sslmode: String,
     pub database_id: String,
     pub records: u64,
     pub transactions: u64,
@@ -208,7 +211,39 @@ enum TxError {
     Fatal(#[from] ReplayError),
 }
 
+/// A TLS failure that retrying cannot fix: untrusted or misnamed server
+/// certificate, client certificate refused, or a server without TLS.
+fn permanent_tls_failure(e: &postgres::Error) -> Option<String> {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = src {
+        let rustls_err = err.downcast_ref::<rustls::Error>().or_else(|| {
+            err.downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        });
+        if let Some(r) = rustls_err {
+            return crate::tls::is_certificate_error(r).then(|| match r {
+                rustls::Error::AlertReceived(a) => {
+                    format!("server rejected the TLS handshake ({a:?}); check sslcert/sslkey")
+                }
+                other => format!("certificate verification failed: {other}"),
+            });
+        }
+        if err.to_string() == "server does not support TLS" {
+            return Some("server does not support TLS (sslmode requires it)".into());
+        }
+        src = err.source();
+    }
+    None
+}
+
 fn classify(e: postgres::Error) -> TxError {
+    if let Some(detail) = permanent_tls_failure(&e) {
+        return TxError::Fatal(ReplayError::Tls {
+            url: "MorletDB".into(),
+            detail,
+        });
+    }
     let transient = e.is_closed()
         || e.code().is_some_and(|c| {
             let s = c.code();
@@ -233,10 +268,7 @@ fn classify(e: postgres::Error) -> TxError {
 }
 
 /// `host:port/dbname` from the connection string, without credentials.
-fn display_destination(conninfo: &str, collection: &str) -> Result<String, ReplayError> {
-    let cfg: postgres::Config = conninfo
-        .parse()
-        .map_err(|e| ReplayError::Config(format!("invalid MorletDB connection string: {e}")))?;
+fn display_destination(cfg: &postgres::Config, collection: &str) -> String {
     let host = cfg
         .get_hosts()
         .first()
@@ -248,7 +280,7 @@ fn display_destination(conninfo: &str, collection: &str) -> Result<String, Repla
         .unwrap_or_else(|| "localhost".into());
     let port = cfg.get_ports().first().copied().unwrap_or(5432);
     let db = cfg.get_dbname().unwrap_or("");
-    Ok(format!("morletdb://{host}:{port}/{db}#{collection}"))
+    format!("morletdb://{host}:{port}/{db}#{collection}")
 }
 
 const SETUP_SQL: &str = "
@@ -288,8 +320,8 @@ struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    fn connect(cfg: &'a MorletConfig) -> Result<Self, TxError> {
-        let client = postgres::Client::connect(&cfg.conninfo, postgres::NoTls).map_err(classify)?;
+    fn connect(cfg: &'a MorletConfig, pg: &PgConnect) -> Result<Self, TxError> {
+        let client = pg.connect().map_err(classify)?;
         Ok(Session { cfg, client })
     }
 
@@ -670,19 +702,38 @@ pub fn run(
                 .into(),
         ));
     }
-    let destination = display_destination(&cfg.conninfo, &cfg.collection)?;
+    let pg = PgConnect::parse(&cfg.conninfo).map_err(ReplayError::Config)?;
+    let destination = display_destination(&pg.config, &cfg.collection);
+    match (pg.mode, pg.explicit) {
+        (SslMode::VerifyFull, false) => eprintln!(
+            "akhet: morlet: non-loopback database host: TLS with sslmode=verify-full (set sslmode in AKHET_MORLET_URL to change)"
+        ),
+        (SslMode::Require, _) => eprintln!(
+            "akhet: morlet: sslmode=require encrypts but does not authenticate the server; prefer verify-full"
+        ),
+        _ => {}
+    }
     let _lock = SinkLock::acquire(spool_path, &cfg.sink)?;
     let mut spool = Spool::open(spool_path, max_db_bytes)?;
     let mut summary = MorletSummary {
         sink: cfg.sink.clone(),
         destination: destination.clone(),
+        sslmode: pg.mode.as_str().into(),
         ..Default::default()
     };
     let mut attempts = 0u32;
     let mut delay = cfg.backoff_initial;
     // Outer loop: (re)connect, reload state from the database, resume.
     loop {
-        match session_loop(&mut spool, cfg, faults, stop, &destination, &mut summary) {
+        match session_loop(
+            &mut spool,
+            cfg,
+            &pg,
+            faults,
+            stop,
+            &destination,
+            &mut summary,
+        ) {
             Ok(()) => return Ok(summary),
             Err(TxError::Fatal(e)) => return Err(e),
             Err(TxError::Transient(m)) => {
@@ -709,12 +760,13 @@ pub fn run(
 fn session_loop(
     spool: &mut Spool,
     cfg: &MorletConfig,
+    pg: &PgConnect,
     faults: &Faults,
     stop: &AtomicBool,
     destination: &str,
     summary: &mut MorletSummary,
 ) -> Result<(), TxError> {
-    let mut sess = Session::connect(cfg)?;
+    let mut sess = Session::connect(cfg, pg)?;
     let db_id = sess.setup()?;
     summary.database_id = db_id.clone();
     let sink_row = spool

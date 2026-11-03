@@ -610,6 +610,7 @@ fn main() -> ExitCode {
                         ReplayError::Locked { .. } => exit::LOCKED,
                         ReplayError::Rejected { .. } | ReplayError::Protocol(_) => exit::REJECTED,
                         ReplayError::Unavailable { .. } => exit::UNAVAILABLE,
+                        ReplayError::Unauthorized { .. } | ReplayError::Tls { .. } => exit::AUTH,
                         ReplayError::Config(_) => 2,
                         _ => exit::ERROR,
                     };
