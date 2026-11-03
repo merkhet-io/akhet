@@ -199,8 +199,12 @@ enum Command {
         config: PathBuf,
         #[arg(long, default_value_t = 100)]
         records_per_tx: usize,
-        /// Feature extractor for new recordings (`none` stores raw only).
-        #[arg(long, default_value = "none")]
+        /// Feature extractor for new recordings: `auto` picks pg_morlet's
+        /// extractor for the recording's rate (`morlet-energy-v1` for
+        /// 128-200000 Hz, `morlet-energy-lowrate-v1` for 1-128 Hz, else
+        /// `none`); `none` stores raw samples only; any other value is passed
+        /// to MorletDB as is.
+        #[arg(long, default_value = "auto")]
         extractor: String,
         #[arg(long, default_value_t = 512)]
         window_size: i32,

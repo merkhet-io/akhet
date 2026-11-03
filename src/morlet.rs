@@ -38,6 +38,22 @@ pub const STATE_VERSION: u32 = 1;
 /// Closed context intervals retained per key for recordings that start later.
 const RETAINED_INTERVALS: usize = 64;
 
+/// Choose the extractor from each recording's rate.
+pub const AUTO_EXTRACTOR: &str = "auto";
+
+/// pg_morlet's extractor for a rate: `morlet-energy-v1` covers
+/// [128, 200000] Hz, `morlet-energy-lowrate-v1` covers [1, 128) Hz (the two
+/// domains are disjoint). Other rates store raw samples only (`none`).
+pub fn extractor_for_rate(rate_hz: f64) -> &'static str {
+    if (128.0..=200_000.0).contains(&rate_hz) {
+        "morlet-energy-v1"
+    } else if (1.0..128.0).contains(&rate_hz) {
+        "morlet-energy-lowrate-v1"
+    } else {
+        "none"
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MorletConfig {
     /// libpq-style connection string or URL. Never logged.
@@ -53,6 +69,8 @@ pub struct MorletConfig {
     pub window_size: i32,
     pub stride: i32,
     pub normalization: String,
+    /// Feature extractor for new recordings: `auto` (by rate, see
+    /// [`extractor_for_rate`]), `none`, or a pg_morlet extractor version.
     pub extractor: String,
     pub sample_quantum: f64,
     pub max_attempts: u32,
@@ -74,7 +92,7 @@ impl MorletConfig {
             window_size: 512,
             stride: 256,
             normalization: "zscore".into(),
-            extractor: "none".into(),
+            extractor: AUTO_EXTRACTOR.into(),
             sample_quantum: 1.0,
             max_attempts: 8,
             backoff_initial: Duration::from_millis(250),
@@ -514,6 +532,10 @@ fn write_batch(
             for o in outputs {
                 match o {
                     GridOutput::Start(s) => {
+                        let extractor = match cfg.extractor.as_str() {
+                            AUTO_EXTRACTOR => extractor_for_rate(s.rate_hz),
+                            e => e,
+                        };
                         let mut meta = b.metadata.clone();
                         meta.insert(
                             "akhet".into(),
@@ -539,7 +561,7 @@ fn write_batch(
                                 &cfg.window_size,
                                 &cfg.stride,
                                 &cfg.normalization,
-                                &cfg.extractor,
+                                &extractor,
                                 &cfg.sample_quantum,
                             ],
                         )
@@ -833,5 +855,27 @@ fn session_loop(
         summary.samples += stats.samples;
         summary.context_rows += stats.context_rows;
         summary.issues += stats.issues;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extractor_follows_pg_morlet_rate_domains() {
+        for (rate, want) in [
+            (0.5, "none"),
+            (1.0, "morlet-energy-lowrate-v1"),
+            (100.0, "morlet-energy-lowrate-v1"),
+            (127.999, "morlet-energy-lowrate-v1"),
+            (128.0, "morlet-energy-v1"),
+            (25_600.0, "morlet-energy-v1"),
+            (200_000.0, "morlet-energy-v1"),
+            (200_001.0, "none"),
+            (f64::NAN, "none"),
+        ] {
+            assert_eq!(extractor_for_rate(rate), want, "{rate}");
+        }
     }
 }
