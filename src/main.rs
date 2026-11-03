@@ -78,6 +78,14 @@ enum Command {
         /// In-memory queue between network and spool (messages).
         #[arg(long, default_value_t = 64)]
         queue_capacity: usize,
+        /// Group commit: most messages per spool transaction (1 = one
+        /// transaction per message). Acknowledged only after that commit.
+        #[arg(long, default_value_t = 64)]
+        max_batch: usize,
+        /// Group commit: after the first message, wait up to this long for
+        /// more before committing (0 = only what is already queued).
+        #[arg(long, default_value_t = 0)]
+        max_linger_ms: u64,
         /// Namespace stating the meaning of --source-id-json-pointer.
         #[arg(long, requires = "source_id_json_pointer")]
         source_id_namespace: Option<String>,
@@ -131,6 +139,13 @@ enum Command {
         follow_interval_ms: u64,
         #[arg(long)]
         limit: Option<u64>,
+        /// Records per HTTP request when the receiver advertises the
+        /// `batch-v1` extension (1 = one POST per record).
+        #[arg(long, default_value_t = 1)]
+        records_per_request: usize,
+        /// Upper bound on one batch request body in bytes.
+        #[arg(long, default_value_t = 8 << 20)]
+        max_request_bytes: usize,
     },
     /// Replay decoded samples and context into MorletDB (PostgreSQL with
     /// pg_morlet). The connection string is read from AKHET_MORLET_URL only.
@@ -323,6 +338,8 @@ fn main() -> ExitCode {
             keep_alive_secs,
             max_payload_bytes,
             queue_capacity,
+            max_batch,
+            max_linger_ms,
             source_id_namespace,
             source_id_json_pointer,
             limit,
@@ -345,6 +362,8 @@ fn main() -> ExitCode {
             cfg.keep_alive = Duration::from_secs(keep_alive_secs);
             cfg.max_payload_bytes = max_payload_bytes;
             cfg.queue_capacity = queue_capacity;
+            cfg.max_batch = max_batch;
+            cfg.max_linger = Duration::from_millis(max_linger_ms);
             cfg.source_identity =
                 source_id_namespace
                     .zip(source_id_json_pointer)
@@ -404,8 +423,12 @@ fn main() -> ExitCode {
             follow,
             follow_interval_ms,
             limit,
+            records_per_request,
+            max_request_bytes,
         } => {
             let mut cfg = ReplayConfig::new(&url, &sink);
+            cfg.records_per_request = records_per_request;
+            cfg.max_request_bytes = max_request_bytes;
             cfg.request_timeout = Duration::from_millis(timeout_ms);
             cfg.max_attempts = max_attempts;
             cfg.backoff_max = Duration::from_millis(max_backoff_ms);

@@ -81,6 +81,7 @@ command gracefully.
  MQTT broker ──> mqtt adapter ───┐                         ┌─> replay ──HTTP──> receiver
                                  ├─> spool (SQLite file) ──┤   (separate        (commits, then
  Modbus TCP  ──> modbus adapter ─┘   one txn per event     │    process)         returns 2xx)
+                                     or MQTT batch
                                                            └─> status / inspect / verify
 ```
 
@@ -90,10 +91,10 @@ Crate layout (`src/`):
 |---|---|
 | `event.rs` | Versioned event format (`format_version` 1), encoding, checksums |
 | `spool.rs` | SQLite spool: schema versioning, append, checksummed reads, capacity, sink checkpoints |
-| `adapters/mqtt.rs` | MQTT 3.1.1 (rumqttc) with acknowledgment after commit |
+| `adapters/mqtt.rs` | MQTT 3.1.1 (rumqttc) with group commit and acknowledgment after commit |
 | `adapters/modbus.rs` | Modbus TCP holding-register polling (tokio-modbus) |
 | `adapters/mod.rs` | Blocking-pool spool handle, stop signal |
-| `replay.rs` | HTTP replay with checkpoint binding, sink lock, bounded retries |
+| `replay.rs` | HTTP replay with checkpoint binding, sink lock, bounded retries, optional batch requests |
 | `receiver.rs` | Example HTTP receiver (`akhet receive`) |
 | `faults.rs` | Fault injection for crash tests (`AKHET_FAULT`) |
 | `main.rs` | CLI |
@@ -307,8 +308,17 @@ and `--sample-quantum` are passed to MorletDB for new recordings.
   `AsyncClient::try_ack`/`ack` is called (`state.rs`,
   `handle_incoming_publish`), and on a connection error `EventLoop::clean()`
   drops queued, unsent PUBACKs.
-- Each message is committed in its own SQLite transaction; only then is its
-  PUBACK queued. A PUBACK is only sent on the connection the message arrived
+- Group commit: the committer takes the next message plus whatever is
+  already queued, up to `--max-batch` messages (default 64), and commits them
+  in ONE SQLite transaction; only after that commit are their PUBACKs queued,
+  in arrival order. If the transaction fails, no message of the batch is
+  acknowledged. At low rates a batch is a single message, so latency does not
+  change; `--max-linger-ms` (default 0) optionally waits for more messages
+  before committing. `--max-batch 1` restores one transaction per message.
+  Each message keeps its own event, `event_id` and dedup checks inside the
+  batch. If one message fails its checks (a conflicting source identity), the
+  messages before it are committed and acknowledged, it and the rest of the
+  batch are not, and collection stops. A PUBACK is only sent on the connection the message arrived
   on: packet ids are connection/session-scoped, so after a reconnect,
   acknowledgments for older messages are skipped (`acks_skipped_after_reconnect`)
   and the broker redelivers those messages.
@@ -377,7 +387,7 @@ and `--sample-quantum` are passed to MorletDB for new recordings.
   number of unacknowledged QoS 1 messages, i.e. by the broker's in-flight
   window (at most 65535 packet ids).
 - Graceful shutdown (SIGINT/SIGTERM, `--limit`): the in-progress commit
-  finishes, queued uncommitted messages are dropped **without** acknowledgment
+  (one batch) finishes, queued uncommitted messages are dropped **without** acknowledgment
   (`dropped_unacknowledged_on_shutdown`), PUBACKs for committed messages are
   flushed, then DISCONNECT is sent (10 s grace).
 - TLS: `--tls` uses the platform trust store; `--tls-ca-file` a PEM CA bundle;
@@ -410,7 +420,8 @@ and `--sample-quantum` are passed to MorletDB for new recordings.
 - The receiver commits durably (same SQLite settings) before answering `201`;
   an identical re-send of an existing `event_id` answers `200`; a different
   body for an existing `event_id` answers `409`.
-- The local checkpoint advances only after a `200`/`201`, one record at a time.
+- The local checkpoint advances only after a `200`/`201`, one record at a time
+  (or, with batches, over the successful prefix of a batch; see below).
   A crash or lost response after the remote commit re-sends the same
   `event_id`, which the receiver deduplicates. This is **at-least-once delivery
   with receiver-side deduplication, not exactly-once**.
@@ -425,13 +436,30 @@ and `--sample-quantum` are passed to MorletDB for new recordings.
   default 30 s) up to `--max-attempts` (default 8), then replay exits with code
   6. Permanent failures (409, other 4xx) stop replay at that record with exit
   code 5. `--follow` keeps polling for new records.
+- Optional batch extension `batch-v1` (opt-in with `--records-per-request N`,
+  default 1). The receiver advertises it in the identity response
+  (`"features": ["batch-v1"]`, plus `batch_max_records`/`batch_max_bytes`);
+  otherwise replay falls back to single POSTs. `POST {url}/v1/events/batch`
+  carries up to N stored bodies byte-exact, each framed as
+  `<event_id> <sha256-hex> <length>\n<body>\n`, and at most
+  `--max-request-bytes` (default 8 MiB) per request. The receiver checks each
+  record like a single POST, commits the accepted ones in one transaction,
+  then answers `200` with one `status_code` per record (`201`, `200`, `409`,
+  …, same meaning as for single POSTs). The checkpoint advances over the
+  contiguous prefix of `201`/`200` only; the first other code is handled
+  like the same code on a single POST. A whole-request `408`/`429`/`5xx`
+  is retried as a unit. A crash or lost response re-sends up to a whole
+  batch, which the receiver deduplicates per record; records after a rejected
+  one may already be stored and show up as duplicates later. Details are in
+  the `src/replay.rs` module docs.
 - Replay runs independently of acquisition (separate process; the SQLite busy
   timeout coordinates access). Sequence numbers are assigned inside the write
   transaction, so a checkpoint never skips a later-committed lower sequence.
 
 ## Durability, integrity and limits
 
-- Every append is `BEGIN IMMEDIATE … COMMIT` with `journal_mode=DELETE`,
+- Every append (one event, or one MQTT group-commit batch) is
+  `BEGIN IMMEDIATE … COMMIT` with `journal_mode=DELETE`,
   `synchronous=FULL` and `fullfsync=ON` (F_FULLFSYNC on macOS, ignored
   elsewhere). When an append returns, SQLite has asked the OS to flush the
   journal and the database. Durability across power loss additionally requires
@@ -516,6 +544,12 @@ Against an external broker (CI runs this with Mosquitto 2):
 AKHET_TEST_BROKER_PORT=1883 cargo test --locked --test mqtt_external -- --ignored
 ```
 
+Group commit and batched replay have their own crash tests: a kill inside a
+batch transaction (`abort:collector.batch_partial`, nothing stored, everything
+redelivered), a kill after a batch commit before its acknowledgments (whole
+batch redelivered), and batched replay killed after the remote commit or after
+the checkpoint, plus a conflict in the middle of a batch.
+
 Against MorletDB (CI runs this with the published pg_morlet image; see the
 header of `tests/morlet.rs`):
 
@@ -525,14 +559,30 @@ AKHET_TEST_MORLET_URL=postgresql://morlet:morlet-test@127.0.0.1:54339/morlet \
 ```
 
 Not covered: power-failure durability, broker restarts with persistence, real
-Modbus devices, long-duration soak tests, throughput or latency benchmarks.
+Modbus devices, long-duration soak tests.
+
+### Benchmark
+
+```sh
+cargo run --release --locked --example throughput            # about 5 minutes
+cargo run --release --locked --example throughput -- --runs 1 --quick
+```
+
+It measures MQTT ingest (messages/s, payload MB/s, commit latency p50/p99,
+with and without group commit) and replay records/s (single vs batch) on
+loopback, with a payload shaped like 8 channels × 4000 samples per 100 ms as
+JSON. Results, settings and hardware are in
+[docs/benchmarks.md](docs/benchmarks.md). They come from one development
+machine (macOS, `F_FULLFSYNC`); numbers for x86_64 and arm64 Linux edge
+hardware are still missing.
 
 ## Scope boundaries
 
 - The MorletDB sink handles MQTT payloads decoded by rules. Irregular Modbus
   polls are not a uniform waveform and are not written to MorletDB.
 - No ML, adaptive discarding, Parquet conversion, custom storage engine,
-  retention/deletion, fleet management or performance claims.
+  retention/deletion, fleet management or performance claims beyond the
+  measurements in docs/benchmarks.md.
 
 ## License
 

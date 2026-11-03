@@ -17,8 +17,13 @@
 //! - The poll task owns the rumqttc `EventLoop`. When the queue is full it
 //!   stops reading the socket (TCP backpressure to the broker) and counts a
 //!   saturation event.
-//! - The committer appends each message in its own SQLite transaction on the
-//!   blocking pool and only then emits an ack notice.
+//! - The committer (group commit) takes the message it waited for plus
+//!   whatever else is already queued, up to `max_batch` messages (optionally
+//!   waiting up to `max_linger` for more), appends them in ONE SQLite
+//!   transaction on the blocking pool and only after that commit emits their
+//!   ack notices, in arrival order. If the transaction fails, nothing from the
+//!   batch is acknowledged. At low rates batches have one message, so latency
+//!   is unchanged with the default `max_linger` of 0.
 //! - The ack task enqueues a PUBACK only if the message arrived on the current
 //!   connection (generation check under a mutex shared with the poll task, which
 //!   bumps the generation and purges stale queued PUBACKs on disconnect). Packet
@@ -90,6 +95,12 @@ pub struct MqttConfig {
     pub keep_alive: Duration,
     pub max_payload_bytes: usize,
     pub queue_capacity: usize,
+    /// Most messages committed in one spool transaction (group commit).
+    /// 1 commits every message in its own transaction.
+    pub max_batch: usize,
+    /// After the first message of a batch, wait up to this long for more
+    /// (until `max_batch`). Zero only takes what is already queued.
+    pub max_linger: Duration,
     pub source_identity: Option<SourceIdentityConfig>,
     /// Stop (gracefully) after this many messages were committed or
     /// recognized as source duplicates.
@@ -123,6 +134,8 @@ impl MqttConfig {
             keep_alive: Duration::from_secs(30),
             max_payload_bytes: 256 * 1024,
             queue_capacity: 64,
+            max_batch: 64,
+            max_linger: Duration::ZERO,
             source_identity: None,
             limit: None,
             reconnect_min: Duration::from_millis(200),
@@ -152,6 +165,12 @@ impl MqttConfig {
         }
         if self.queue_capacity == 0 || self.queue_capacity > 65_535 {
             return c("queue capacity must be 1..=65535");
+        }
+        if self.max_batch == 0 || self.max_batch > 65_535 {
+            return c("max batch must be 1..=65535");
+        }
+        if self.max_linger > Duration::from_secs(10) {
+            return c("max linger must be at most 10 s");
         }
         if self.max_payload_bytes == 0 || self.max_payload_bytes > 64 * 1024 * 1024 {
             return c("max payload bytes must be 1..=67108864");
@@ -233,6 +252,10 @@ pub struct MqttSummary {
     pub received: u64,
     pub committed: u64,
     pub source_duplicates: u64,
+    /// Spool transactions used (group commit: one per batch).
+    pub commit_transactions: u64,
+    /// Largest number of messages committed in one transaction.
+    pub max_batch_committed: u64,
     pub acks_enqueued: u64,
     pub acks_skipped_after_reconnect: u64,
     pub queue_saturation_events: u64,
@@ -250,6 +273,8 @@ struct Counters {
     received: AtomicU64,
     committed: AtomicU64,
     source_duplicates: AtomicU64,
+    transactions: AtomicU64,
+    max_batch: AtomicU64,
     acks_enqueued: AtomicU64,
     acks_skipped: AtomicU64,
     saturation: AtomicU64,
@@ -267,6 +292,8 @@ impl Counters {
             received: g(&self.received),
             committed: g(&self.committed),
             source_duplicates: g(&self.source_duplicates),
+            commit_transactions: g(&self.transactions),
+            max_batch_committed: g(&self.max_batch),
             acks_enqueued: g(&self.acks_enqueued),
             acks_skipped_after_reconnect: g(&self.acks_skipped),
             queue_saturation_events: g(&self.saturation),
@@ -985,53 +1012,112 @@ async fn committer(
 ) {
     let faults = spool.faults().clone();
     loop {
-        let item = tokio::select! {
+        let first = tokio::select! {
             biased;
             _ = stop.wait() => break,
             m = rx.recv() => match m { Some(m) => m, None => break },
         };
-        if item.publish.qos == QoS::AtMostOnce {
-            counters.qos0.fetch_add(1, Ordering::Relaxed);
+        // Group commit: never more than the remaining --limit, so a limit
+        // still stops after exactly that many messages.
+        let done = counters.committed.load(Ordering::Relaxed)
+            + counters.source_duplicates.load(Ordering::Relaxed);
+        let cap = match cfg.limit {
+            Some(l) => (l.saturating_sub(done) as usize).clamp(1, cfg.max_batch),
+            None => cfg.max_batch,
+        };
+        let mut batch = vec![first];
+        while batch.len() < cap {
+            match rx.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(_) => break,
+            }
         }
-        faults.hit(point::MQTT_BEFORE_COMMIT);
-        let (ev, claim) = to_event(&cfg, &item);
-        if let EventData::MqttMessage(m) = &ev.data
-            && m.subscriptions.is_empty()
-        {
-            counters.unmatched.fetch_add(1, Ordering::Relaxed);
-        }
-        let outcome = spool.append(ev, claim).await;
-        match outcome {
-            Ok(o) => {
-                faults.hit(point::MQTT_AFTER_COMMIT);
-                match o {
-                    AppendOutcome::Inserted { .. } => {
-                        counters.committed.fetch_add(1, Ordering::Relaxed);
-                    }
-                    AppendOutcome::DuplicateSource { seq }
-                    | AppendOutcome::DuplicateEvent { seq } => {
-                        counters.source_duplicates.fetch_add(1, Ordering::Relaxed);
-                        log(format!(
-                            "mqtt: redelivery of source identity already stored at seq {seq}; acknowledging without a new record"
-                        ));
-                    }
-                }
-                let _ = ack_tx.send(AckNotice {
-                    publish: item.publish,
-                    generation: item.generation,
-                });
-                let done = counters.committed.load(Ordering::Relaxed)
-                    + counters.source_duplicates.load(Ordering::Relaxed);
-                if cfg.limit.is_some_and(|l| done >= l) {
-                    log(format!("mqtt: limit of {done} messages reached; stopping"));
-                    stop.trigger();
+        if !cfg.max_linger.is_zero() && batch.len() < cap {
+            let deadline = tokio::time::Instant::now() + cfg.max_linger;
+            while batch.len() < cap {
+                tokio::select! {
+                    biased;
+                    _ = stop.wait() => break,
+                    m = tokio::time::timeout_at(deadline, rx.recv()) => match m {
+                        Ok(Some(m)) => batch.push(m),
+                        Ok(None) | Err(_) => break,
+                    },
                 }
             }
+        }
+        for item in &batch {
+            if item.publish.qos == QoS::AtMostOnce {
+                counters.qos0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        faults.hit(point::MQTT_BEFORE_COMMIT);
+        let events: Vec<(Event, Option<SourceClaim>)> =
+            batch.iter().map(|item| to_event(&cfg, item)).collect();
+        for (ev, _) in &events {
+            if let EventData::MqttMessage(m) = &ev.data
+                && m.subscriptions.is_empty()
+            {
+                counters.unmatched.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let outcome = spool.append_batch(events).await;
+        let results = match outcome {
+            Ok(r) => r,
             Err(e) => {
-                // Not committed: never acknowledged. Stop visibly.
+                // Transaction rolled back: nothing from the batch is stored,
+                // so nothing is acknowledged. Stop visibly.
                 set_fatal(&fatal, CollectError::Spool(e), &stop);
                 break;
             }
+        };
+        faults.hit(point::MQTT_AFTER_COMMIT);
+        counters.transactions.fetch_add(1, Ordering::Relaxed);
+        counters
+            .max_batch
+            .fetch_max(batch.len() as u64, Ordering::Relaxed);
+        // Results are in arrival order and end at the first item failure;
+        // the items before it are committed and may be acknowledged.
+        let batch_len = batch.len();
+        let mut item_error = None;
+        let mut acked = 0;
+        for (item, result) in batch.into_iter().zip(results) {
+            match result {
+                Ok(AppendOutcome::Inserted { .. }) => {
+                    counters.committed.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(
+                    AppendOutcome::DuplicateSource { seq } | AppendOutcome::DuplicateEvent { seq },
+                ) => {
+                    counters.source_duplicates.fetch_add(1, Ordering::Relaxed);
+                    log(format!(
+                        "mqtt: redelivery of source identity already stored at seq {seq}; acknowledging without a new record"
+                    ));
+                }
+                Err(e) => {
+                    item_error = Some(e);
+                    break;
+                }
+            }
+            let _ = ack_tx.send(AckNotice {
+                publish: item.publish,
+                generation: item.generation,
+            });
+            acked += 1;
+        }
+        if let Some(e) = item_error {
+            // Not stored (e.g. conflicting source identity): never
+            // acknowledged; the rest of the batch was not attempted.
+            counters
+                .dropped
+                .fetch_add((batch_len - acked - 1) as u64, Ordering::Relaxed);
+            set_fatal(&fatal, CollectError::Spool(e), &stop);
+            break;
+        }
+        let done = counters.committed.load(Ordering::Relaxed)
+            + counters.source_duplicates.load(Ordering::Relaxed);
+        if cfg.limit.is_some_and(|l| done >= l) {
+            log(format!("mqtt: limit of {done} messages reached; stopping"));
+            stop.trigger();
         }
     }
     // Anything still queued was never committed: drop without acknowledgment.
