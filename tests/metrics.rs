@@ -169,14 +169,21 @@ async fn mqtt_metrics_move_and_readiness_follows_broker() {
     assert_eq!(ep.metric("akhet_mqtt_messages_received_total"), Some(3.0));
     assert_eq!(ep.metric("akhet_mqtt_messages_committed_total"), Some(3.0));
     assert_eq!(ep.metric("akhet_mqtt_queue_depth"), Some(0.0));
+    // Group commit: one observation per transaction, 1 to 3 here depending
+    // on how the messages were batched.
+    let txs = ep
+        .metric("akhet_mqtt_commit_transactions_total")
+        .expect("transactions counter");
+    assert!((1.0..=3.0).contains(&txs), "{txs}");
     assert_eq!(
         ep.metric("akhet_spool_commit_duration_seconds_count"),
-        Some(3.0)
+        Some(txs)
     );
     assert_eq!(
         ep.metric("akhet_spool_commit_duration_seconds_bucket{le=\"+Inf\"}"),
-        Some(3.0)
+        Some(txs)
     );
+    assert!(ep.metric("akhet_mqtt_max_batch_committed").unwrap() >= 1.0);
     // Spool gauges come from the sampler, so they follow with a short delay.
     ep.wait_metric("akhet_spool_last_seq", |v| v == 3.0);
     let used = ep.metric("akhet_spool_db_bytes_used").unwrap();
@@ -193,14 +200,17 @@ async fn mqtt_metrics_move_and_readiness_follows_broker() {
         [
             "acks_enqueued",
             "acks_skipped_after_reconnect",
+            "commit_transactions",
             "committed",
             "connection_errors",
             "connections",
             "dropped_unacknowledged_on_shutdown",
+            "max_batch_committed",
             "qos0_messages",
             "queue_saturation_events",
             "received",
             "source_duplicates",
+            "unmatched_messages",
         ]
     );
     assert_eq!(summary["committed"], 3);
@@ -385,12 +395,15 @@ fn replay_metrics_move_and_readiness_follows_receiver() {
     assert_eq!(
         keys(&summary),
         [
+            "batch_protocol",
             "checkpoint_seq",
             "delivered",
             "destination_url",
             "interrupted",
+            "pruned_records",
             "receiver_duplicates",
             "receiver_id",
+            "requests",
             "retries",
             "sink",
         ]

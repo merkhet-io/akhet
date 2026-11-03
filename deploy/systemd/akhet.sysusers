@@ -1,0 +1,4 @@
+# systemd-sysusers(8) entry: install as /usr/lib/sysusers.d/akhet.conf (or
+# /etc/sysusers.d/akhet.conf) and run `systemd-sysusers`. Both units run as this
+# user so the collector and replay share the spool file.
+u akhet - "Akhet collector" /var/lib/akhet -

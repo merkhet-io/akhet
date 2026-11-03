@@ -21,6 +21,17 @@ alias akhet=./target/release/akhet   # or use `cargo run --release --` below
 akhet --help
 ```
 
+## Deployment
+
+Tagged releases (`v*`) publish static Linux binaries for x86_64 and aarch64
+with `SHA256SUMS` and GitHub build-provenance attestations, plus a multi-arch
+container image (`ghcr.io/merkhet-io/akhet`, distroless, non-root, `/data`
+volume). `deploy/` has hardened systemd units and a single-replica Kubernetes
+StatefulSet. [docs/deployment.md](docs/deployment.md) covers installation,
+verification, the one-collector-per-spool rule and the upgrade path for an
+existing spool (today a build refuses a spool with a different schema version
+rather than migrating it).
+
 ## Local example without hardware
 
 Development-only peers ship as Cargo examples: an embedded MQTT broker
@@ -39,9 +50,10 @@ cargo run --example modbus_simulator -- 127.0.0.1:5020
 akhet --spool data/spool.sqlite modbus --host 127.0.0.1 --port 5020 \
   --device-id 1 --address 0 --count 4 --interval-ms 1000 --timeout-ms 1000 --limit 3
 
-# Terminal 3: collect MQTT (stop with Ctrl-C, or use --limit N)
+# Terminal 3: collect MQTT (stop with Ctrl-C, or use --limit N);
+#             repeat --topic for several filters
 akhet --spool data/spool.sqlite mqtt --host 127.0.0.1 --port 1883 \
-  --client-id akhet-example-01 --topic 'sensors/#'
+  --client-id akhet-example-01 --topic 'sensors/#' --topic 'plant/line1/+'
 
 # Terminal 4: publish three QoS 1 messages
 cargo run --example mqtt_publish -- 127.0.0.1:1883 sensors/demo 3
@@ -57,6 +69,10 @@ akhet receive --listen 127.0.0.1:8080 --db data/receiver.sqlite
 # Replay (run as often as you like; it resumes from the sink checkpoint)
 akhet --spool data/spool.sqlite replay --url http://127.0.0.1:8080 --sink local-demo
 akhet --spool data/receiver.sqlite inspect
+
+# Delete records every bound sink has acknowledged (see Retention)
+akhet --spool data/spool.sqlite prune --min-age 0s --dry-run
+akhet --spool data/spool.sqlite prune --min-age 0s
 ```
 
 `--spool` can also be set with `AKHET_SPOOL`. Collectors and replay print a
@@ -69,6 +85,7 @@ command gracefully.
  MQTT broker ──> mqtt adapter ───┐                         ┌─> replay ──HTTP──> receiver
                                  ├─> spool (SQLite file) ──┤   (separate        (commits, then
  Modbus TCP  ──> modbus adapter ─┘   one txn per event     │    process)         returns 2xx)
+                                     or MQTT batch
                                                            └─> status / inspect / verify
 ```
 
@@ -77,12 +94,13 @@ Crate layout (`src/`):
 | Module | Role |
 |---|---|
 | `event.rs` | Versioned event format (`format_version` 1), encoding, checksums |
-| `spool.rs` | SQLite spool: schema versioning, append, checksummed reads, capacity, sink checkpoints |
-| `adapters/mqtt.rs` | MQTT 3.1.1 (rumqttc) with acknowledgment after commit |
+| `spool.rs` | SQLite spool: schema versioning, append, checksummed reads, capacity, sink checkpoints, pruning |
+| `adapters/mqtt.rs` | MQTT 3.1.1 (rumqttc) with group commit and acknowledgment after commit |
 | `adapters/modbus.rs` | Modbus TCP holding-register polling (tokio-modbus) |
 | `adapters/mod.rs` | Blocking-pool spool handle, stop signal |
-| `replay.rs` | HTTP replay with checkpoint binding, sink lock, bounded retries |
-| `receiver.rs` | Example HTTP receiver (`akhet receive`) |
+| `replay.rs` | HTTP replay with checkpoint binding, sink lock, bounded retries, optional batch requests, TLS and token auth |
+| `receiver.rs` | Example HTTP receiver (`akhet receive`): minimal HTTP/1.1, optional TLS and auth, batch extension |
+| `tls.rs` | PEM loading and rustls configuration shared by MQTT, replay and receiver |
 | `faults.rs` | Fault injection for crash tests (`AKHET_FAULT`) |
 | `metrics.rs` | Optional Prometheus metrics, liveness and readiness endpoint |
 | `main.rs` | CLI |
@@ -101,9 +119,15 @@ generated once at capture and unchanged by retries), `collected_unix_ns`
 unknown `format_version` values. The format is an example contract, not a
 stable public interchange format.
 
-MQTT (`kind: "mqtt_message"`): `broker`, `client_id`, `subscription`, `topic`,
-`qos`, `retain`, `dup`, `payload_base64` (raw bytes, standard base64),
-`payload_len`, optional `source_identity_error`.
+MQTT (`kind: "mqtt_message"`): `broker`, `client_id`, `subscription`,
+`subscriptions`, `topic`, `qos`, `retain`, `dup`, `payload_base64` (raw bytes,
+standard base64), `payload_len`, optional `source_identity_error`.
+`subscriptions` lists every configured `--topic` filter that matches `topic`
+(MQTT 3.1.1 wildcard rules for `+` and `#`), in configuration order;
+`subscription` is the first of them, or `""` when none matches (see below).
+`subscriptions` was added within `format_version` 1: records written before it
+lack the field, and in them `subscription` is the single configured filter.
+Readers that ignore unknown fields are unaffected.
 
 Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
 (`read_holding_registers`), `start_address` (zero-based), `count`,
@@ -112,6 +136,173 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
 (raw uint16) or `status: "read_failed"` with `error_kind`
 (`connect`|`timeout`|`transport`|`exception`|`response_length`|`resolve`) and
 `message`. Failed reads never carry register values.
+
+### Payload decoding (read-only)
+
+`akhet decode --config <file>` maps spooled MQTT payloads to per-channel
+sample batches. It reads the spool and never modifies it: the raw payload bytes
+stay stored exactly as received, and a corrected decoder config can be re-run
+over the same records.
+
+```sh
+akhet --spool data/s.sqlite decode --config examples/decoder.json            # counts and ranges
+akhet --spool data/s.sqlite decode --config examples/decoder.json --samples  # full arrays
+akhet --spool data/s.sqlite decode --config examples/decoder.json --summary-only
+```
+
+Supported shape: one message holds one or more *signal groups*; each group has
+one timestamp array and one value array per signal, all of equal length. The
+config (JSON, `format_version: 1`, see `examples/decoder.json`) has one rule
+per topic filter; the first matching rule applies:
+
+| Field | Meaning |
+|---|---|
+| `topic` | MQTT filter (`+`, `#`) |
+| `source` | Source template: `{topic}`, `{topic.N}` (zero-based level), `{/json/pointer}` into the message |
+| `groups` | Optional JSON pointer to the array of groups; absent = the message is one group |
+| `group` | Group name template; additionally `{group:/pointer}` into the group |
+| `timestamps`, `timestamp_unit` | Pointer to the integer timestamp array; `ns`, `us`, `ms` or `s` since the Unix epoch |
+| `signals` | `{"map": "/pointer"}` (object of name → array) or `{"list": [{"name", "pointer"}]}` |
+| `units`, `default_unit` | Unit per signal name; a signal without a unit is an issue, never unlabelled |
+| `metadata` | Static JSON object attached to every channel |
+
+A channel is identified by `(source, group, signal)`. Validation per group:
+integer timestamps, strictly increasing within the group, equal array lengths,
+finite numeric values, a configured unit, and no channel twice in one message.
+Every failure is an explicit issue with its kind (`no_matching_rule`,
+`not_json`, `bad_structure`, `bad_template`, `bad_timestamp`,
+`non_monotonic_timestamps`, `length_mismatch`, `non_finite_value`, `no_unit`,
+`too_large`, `duplicate_channel`), rule, topic, group index, signal and sample
+index. A group with an issue yields no batches, so a group is never partly
+decoded; other groups of the same message still decode. Values are parsed as
+IEEE 754 float64 from the JSON text and are bit-exact for numbers that
+round-trip through float64.
+
+Decoding does not interpret timing: it reports the publisher's timestamps
+as given. Converting timestamps to a uniform sample grid is a separate step.
+
+### Sample grid placement (read-only)
+
+`akhet grid --config <file> [--chunks [--samples]]` places decoded samples of
+each channel on a uniform grid (sample rate, anchor timestamp, integer sample
+offsets), the form a uniformly sampled store needs. Dropping per-sample
+timestamps is only honest when they lie on a regular grid, so placement is
+strict:
+
+- A sample within the tolerance of the next grid position is placed there.
+- A sample within tolerance of a *later* grid position ends the recording
+  (`gap`, with the number of missing grid positions); one off the grid ends it
+  as `off_grid` or, when the re-estimated rate differs, `rate_change`. The next
+  recording starts at that sample and records the discontinuity (reason,
+  previous recording, its last timestamp, gap length). Missing values are
+  never invented.
+- A timestamp at or before the latest one is never reordered: an exact repeat
+  (same timestamp and value bits, within the last `dedup_window_samples`) is
+  skipped as a duplicate, which absorbs redelivered batches; a different value
+  is a `conflict` issue; anything else is an `out_of_order` issue.
+- Samples are never interpolated, resampled or moved by more than the
+  tolerance. The reconstructed timestamp of sample `k` is
+  `anchor_unix_ns + round(k * 1e9 / rate_hz)`.
+
+Per rule, `timing` sets `rate_hz` (absent: estimated per recording from the
+median spacing of its first `estimate_samples` samples, rounded to
+`rate_resolution_hz`), `tolerance_ns` or `tolerance_fraction` of a period
+(default 0.1), `dedup_window_samples` (8192) and `max_chunk_samples` (32768).
+
+Recording keys are deterministic: `<source>/<group>/<signal>@<anchor_unix_ns>`
+(parts percent-encoded). Each chunk carries timing evidence: the original
+timestamps of its first and last sample and the maximum and RMS deviation from
+the grid. The summary reports per channel: samples in and placed, duplicates,
+conflicts, out-of-order and unplaced samples, recordings, splits by reason,
+missing samples in gaps, maximum and RMS reconstruction error, and
+`samples_beyond_tolerance` (zero by construction, reported as a check).
+
+The grid state of a channel is serializable so a replay sink can persist it
+atomically with its checkpoint. Clock drift of the source is not corrected; it
+shows up as growing deviation and, beyond the tolerance, as splits.
+### Context timelines (read-only)
+
+Controller signals such as program number, tool, part count or feed override
+change irregularly and are not waveforms. List them in a rule's
+`context_signals`; their values may be numbers, strings (up to 1024 bytes) or
+booleans and need no unit (`bad_context_value` otherwise).
+
+`akhet context --config <file>` turns their observations into change events
+with last-value-held semantics, printed as JSON lines with a summary per
+channel:
+
+- Repeated observations of the value in effect produce no event.
+- A newer observation with a different value is a change event with the
+  publisher timestamp (`clock: "source"`), the collector timestamp of the
+  message (`collected_unix_ns`) and the previous value.
+- A late or out-of-order observation never rewrites the timeline: if it agrees
+  with the value in effect at its time it is counted as `late_consistent`
+  (this absorbs redelivered messages); otherwise it is a `late_conflict` issue,
+  or `late_unknown` when it predates the retained history (4096 changes per
+  channel).
+
+The timeline is a deterministic function of the spooled records in order, so
+it can be rebuilt exactly from the spool. Values compare as JSON values (`1`
+and `1.0` differ).
+
+### MorletDB sink
+
+`akhet morlet` replays the spool into PostgreSQL with the `pg_morlet`
+extension. Per record: `decode` → `grid` per waveform channel → recordings and
+chunks in a MorletDB stream collection; `context_signals` → interval rows in
+the collection's context timeline.
+
+```sh
+export AKHET_MORLET_URL='postgresql://user:password@db.example:5432/morlet'   # never on argv
+akhet --spool data/s.sqlite morlet --sink central --collection signals \
+  --config decoder.json --create-collection --follow
+```
+
+- **Recordings:** one per grid recording, created with
+  `morlet_ensure_recording(rate, channel = "<source>/<group>/<signal>", unit,
+  metadata)`. Metadata holds the rule's static metadata plus an `akhet`
+  object: source, group, signal, anchor timestamp, whether the rate was
+  estimated, the tolerance and the discontinuity that started it. Chunks go
+  through `morlet_append_chunk` at the grid's sample offsets; values are sent
+  as binary float64 and read back bit-exactly.
+- **Timing evidence:** per chunk in `akhet_morlet_evidence` (first/last
+  original timestamp, max/RMS deviation, spool seq).
+- **Explicit issues:** decode, timing and context issues go to
+  `akhet_morlet_issues` (sink, spool seq, kind and details).
+- **Context:** for each context key of a source, the value in effect becomes
+  an interval `[start_sample, end_sample)` on every recording of the same
+  source it overlaps (key = signal name). An interval is written once its end
+  is known: at the next change, or clipped at the end of a recording. The
+  value still in effect on an active recording is not written yet. Times map
+  to the first sample at or after the change.
+- **Exactness:** derived state (grid state per channel, context timelines,
+  written context offsets) lives in `akhet_morlet_sinks` and is updated **in
+  the same transaction** as the samples, context rows and the sink's spool
+  checkpoint. On any error or crash, the transaction rolls back and the sink
+  resumes from the committed state. The local checkpoint is advanced after the
+  commit and moved forward from the database if a crash came in between; a
+  database checkpoint *behind* the local one (restored database) is refused.
+  Crash tests at the existing replay fault points show no lost or duplicated
+  samples.
+- **Binding:** the database gets a random `database_id` (table
+  `akhet_morlet_identity`), used like a receiver identity; a sink name is
+  bound to one spool, one collection and one database. Re-using it elsewhere
+  is refused (exit 3).
+- **Errors:** connection-class failures are retried with bounded backoff
+  (exit 6 when exhausted). Anything MorletDB rejects (conflicting samples at
+  an existing offset, overlapping context, a rate or chunk it refuses) is
+  permanent (exit 5), with the database message.
+- **Privileges:** the role needs to create the `akhet_morlet_*` tables in its
+  schema (once) and use the collection; `--create-collection` additionally
+  creates the stream collection and its context tables.
+
+Limits: the connection has no TLS yet (use a local socket, a VPN or a
+TLS-terminating proxy). One sink transaction holds `--records-per-tx`
+records; the stored state grows with the number of channels and
+`dedup_window_samples`, and is rewritten on every transaction. Two sinks must
+not write the same recordings. Feature extraction defaults to `none` (raw
+storage only); `--extractor`, `--window-size`, `--stride`, `--normalization`
+and `--sample-quantum` are passed to MorletDB for new recordings.
 
 ## Delivery semantics
 
@@ -123,8 +314,17 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
   `AsyncClient::try_ack`/`ack` is called (`state.rs`,
   `handle_incoming_publish`), and on a connection error `EventLoop::clean()`
   drops queued, unsent PUBACKs.
-- Each message is committed in its own SQLite transaction; only then is its
-  PUBACK queued. A PUBACK is only sent on the connection the message arrived
+- Group commit: the committer takes the next message plus whatever is
+  already queued, up to `--max-batch` messages (default 64), and commits them
+  in ONE SQLite transaction; only after that commit are their PUBACKs queued,
+  in arrival order. If the transaction fails, no message of the batch is
+  acknowledged. At low rates a batch is a single message, so latency does not
+  change; `--max-linger-ms` (default 0) optionally waits for more messages
+  before committing. `--max-batch 1` restores one transaction per message.
+  Each message keeps its own event, `event_id` and dedup checks inside the
+  batch. If one message fails its checks (a conflicting source identity), the
+  messages before it are committed and acknowledged, it and the rest of the
+  batch are not, and collection stops. A PUBACK is only sent on the connection the message arrived
   on: packet ids are connection/session-scoped, so after a reconnect,
   acknowledgments for older messages are skipped (`acks_skipped_after_reconnect`)
   and the broker redelivers those messages.
@@ -140,8 +340,36 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
   overflows, messages are lost upstream and Akhet cannot detect it. The bundled
   example broker is in-memory. Observed: rumqttd redelivers with `dup=false`;
   treat `dup` as informational only.
-- The subscription is (re)issued only when the broker reports no session.
-  Changing `--topic` for an existing `--client-id` requires a new client id.
+- Several filters: `--topic` is repeatable. Filters are validated (non-empty,
+  MQTT 3.1.1 wildcard syntax, no duplicates) and subscribed with QoS 1 in one
+  SUBSCRIBE; every SUBACK return code is checked. Overlapping filters (e.g.
+  `plant/#` and `plant/line1/+`) are allowed; the broker may then deliver a
+  message once or once per matching filter, and each delivered copy is stored.
+  All filters share one persistent session, one queue and one spool.
+- Subscriptions of an existing session: re-subscribing would make the broker
+  re-send retained messages, so with `session_present=true` the collector only
+  applies the difference to the filter set it last confirmed for this broker
+  address and client id. That set is recorded in the spool's `meta` table
+  (not an event, never replayed), written before each change and after the
+  broker acknowledges it. Added filters are subscribed (retained messages for
+  them arrive once); removed filters are unsubscribed. With
+  `session_present=false` the broker holds no subscriptions and all filters
+  are subscribed. Consequences:
+  - Messages the broker queued for a removed filter before it processed the
+    UNSUBSCRIBE are still delivered; they are stored with `subscription: ""`,
+    `subscriptions: []` and counted in `unmatched_messages`.
+  - A removal is recorded once the broker sends UNSUBACK; until then the next
+    start sends the UNSUBSCRIBE again. Capture of the configured filters does
+    not wait for it. Observed: the bundled example broker (rumqttd 0.20) never
+    answers UNSUBSCRIBE on a resumed session and keeps delivering the removed
+    filter; Mosquitto 2 removes it.
+  - The record lives in the spool. If the spool has none for a session the
+    broker still holds (new or replaced spool file, or a collector built
+    before this change), all configured filters are subscribed (retained
+    messages arrive again) and filters subscribed earlier that are no longer
+    configured cannot be identified, so they are not removed. Do not share a
+    `--client-id` between spools or tools; to start from a clean slate, use a
+    new client id.
 - If the broker grants less than QoS 1, collection stops with an error.
   Publications sent with QoS 0 are delivered at QoS 0, recorded with `qos: 0`
   and counted (`qos0_messages`); they have no redelivery guarantee. QoS 2 is
@@ -165,7 +393,7 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
   number of unacknowledged QoS 1 messages, i.e. by the broker's in-flight
   window (at most 65535 packet ids).
 - Graceful shutdown (SIGINT/SIGTERM, `--limit`): the in-progress commit
-  finishes, queued uncommitted messages are dropped **without** acknowledgment
+  (one batch) finishes, queued uncommitted messages are dropped **without** acknowledgment
   (`dropped_unacknowledged_on_shutdown`), PUBACKs for committed messages are
   flushed, then DISCONNECT is sent (10 s grace).
 - TLS: `--tls` uses the platform trust store; `--tls-ca-file` a PEM CA bundle;
@@ -198,7 +426,8 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
 - The receiver commits durably (same SQLite settings) before answering `201`;
   an identical re-send of an existing `event_id` answers `200`; a different
   body for an existing `event_id` answers `409`.
-- The local checkpoint advances only after a `200`/`201`, one record at a time.
+- The local checkpoint advances only after a `200`/`201`, one record at a time
+  (or, with batches, over the successful prefix of a batch; see below).
   A crash or lost response after the remote commit re-sends the same
   `event_id`, which the receiver deduplicates. This is **at-least-once delivery
   with receiver-side deduplication, not exactly-once**.
@@ -212,14 +441,101 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
   with exponential backoff (250 ms doubling, capped by `--max-backoff-ms`,
   default 30 s) up to `--max-attempts` (default 8), then replay exits with code
   6. Permanent failures (409, other 4xx) stop replay at that record with exit
-  code 5. `--follow` keeps polling for new records.
+  code 5. Authentication failures (401/403 from either endpoint, an untrusted
+  or mismatched server certificate, a client certificate the server refuses)
+  are not retried and exit with code 8; the checkpoint stays where it was.
+  `--follow` keeps polling for new records.
+- Optional batch extension `batch-v1` (opt-in with `--records-per-request N`,
+  default 1). The receiver advertises it in the identity response
+  (`"features": ["batch-v1"]`, plus `batch_max_records`/`batch_max_bytes`);
+  otherwise replay falls back to single POSTs. `POST {url}/v1/events/batch`
+  carries up to N stored bodies byte-exact, each framed as
+  `<event_id> <sha256-hex> <length>\n<body>\n`, and at most
+  `--max-request-bytes` (default 8 MiB) per request. The receiver checks each
+  record like a single POST, commits the accepted ones in one transaction,
+  then answers `200` with one `status_code` per record (`201`, `200`, `409`,
+  …, same meaning as for single POSTs). The checkpoint advances over the
+  contiguous prefix of `201`/`200` only; the first other code is handled
+  like the same code on a single POST. A whole-request `408`/`429`/`5xx`
+  is retried as a unit. A crash or lost response re-sends up to a whole
+  batch, which the receiver deduplicates per record; records after a rejected
+  one may already be stored and show up as duplicates later. Details are in
+  the `src/replay.rs` module docs. Batch requests carry the same bearer token and
+  TLS settings as single POSTs.
 - Replay runs independently of acquisition (separate process; the SQLite busy
   timeout coordinates access). Sequence numbers are assigned inside the write
   transaction, so a checkpoint never skips a later-committed lower sequence.
 
+### Secure replay: TLS and bearer tokens
+
+Replay and the example receiver can use TLS (rustls with ring, the same
+rustls 0.23 as the MQTT client), mutual TLS and a bearer token. All three are
+optional and independent; use TLS plus at least one of token or client
+certificate whenever replay crosses a network you do not control.
+
+```sh
+# Receiver: TLS, a required token, and (optionally) required client certificates
+export AKHET_RECEIVER_TOKEN="$(cat /path/to/token)"
+akhet receive --listen 0.0.0.0:8443 --db data/receiver.sqlite \
+  --tls-cert server.pem --tls-key server.key --client-ca clients-ca.pem
+
+# Replay: https, a private CA, the same token, and a client certificate
+export AKHET_REPLAY_TOKEN="$(cat /path/to/token)"
+akhet --spool data/spool.sqlite replay --url https://receiver.example:8443 --sink central \
+  --ca-file ca.pem --client-cert edge.pem --client-key edge.key
+```
+
+- `https://` URLs verify the server certificate and host name against the
+  platform trust store (`rustls-native-certs`), or only against `--ca-file`
+  (PEM bundle) when given. `--client-cert`/`--client-key` (PEM) present a
+  client certificate. TLS options with an `http://` URL are a configuration
+  error (exit 2).
+- The token is read only from `AKHET_REPLAY_TOKEN` / `AKHET_RECEIVER_TOKEN`
+  (never from arguments, so it does not show up in process listings), is never
+  printed, and is sent as `Authorization: Bearer <token>` on every request.
+  Allowed characters: `A-Z a-z 0-9 - . _ ~ + / =`. An empty variable means no
+  token.
+- Replay refuses to send a token over plain `http://` (exit 2, before any
+  connection is made) unless `--allow-insecure-token` is given. The flag exists
+  for loopback use and for a TLS-terminating proxy on the same host; anywhere
+  else the token would travel in cleartext. Replay never follows redirects.
+- The receiver requires the token on every path (including `/v1/identity`) and
+  answers `401` otherwise. It compares SHA-256 digests of the presented and
+  expected tokens in constant time. With `--client-ca`, the TLS handshake fails
+  unless the client presents a certificate chaining to that CA; certificate
+  checks happen at the TLS layer, so they do not produce an HTTP status.
+- Classification: a certificate rejected by either side and `401`/`403` are
+  permanent (exit 8, no retries, checkpoint unchanged). Retrying cannot fix a
+  wrong CA, host name, certificate or token, and repeated attempts with a bad
+  credential only fill logs. Other TLS and network errors stay transient.
+- The receiver's HTTP layer is a small HTTP/1.1 subset written for this
+  example (one request per connection, `Content-Length` bodies only, bounded
+  head and body, 10 s socket timeouts) so that plain TCP and TLS share one code
+  path and the binary carries a single rustls version.
+
+What this protects, and what it does not:
+
+- Protects: confidentiality and integrity of events and the token in transit;
+  the replayer's assurance that it talks to the receiver named in the URL (or
+  holding a certificate from your CA); the receiver's assurance that a client
+  knows the token and, with `--client-ca`, holds a key certified by that CA.
+- Does not protect: **the spool and receiver databases at rest are not
+  encrypted**, and the token sits in the process environment; anyone who can
+  read those files or that environment gets the data or the credential. A
+  token is a shared secret with no expiry, scope or rotation support beyond
+  restarting both sides. A client certificate's identity is not mapped to a
+  sink, source or authorization decision: any certified client may write any
+  event. There is no certificate revocation checking (no CRL/OCSP), no rate
+  limiting, and the single-threaded receiver can be stalled by a slow client
+  for up to its socket timeout. Akhet does not sign events end to end; the
+  receiver trusts whatever an authenticated client sends.
+- The receiver remains an example endpoint. For production, put the protocol
+  behind a service you operate and review.
+
 ## Durability, integrity and limits
 
-- Every append is `BEGIN IMMEDIATE … COMMIT` with `journal_mode=DELETE`,
+- Every append (one event, or one MQTT group-commit batch) is
+  `BEGIN IMMEDIATE … COMMIT` with `journal_mode=DELETE`,
   `synchronous=FULL` and `fullfsync=ON` (F_FULLFSYNC on macOS, ignored
   elsewhere). When an append returns, SQLite has asked the OS to flush the
   journal and the database. Durability across power loss additionally requires
@@ -247,11 +563,67 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
   additional space. A full filesystem below the limit is reported separately
   ("filesystem full"). Pass the same `--max-db-bytes` to every command that
   writes a spool (the limit is applied per connection).
-- Retention: records are kept; this increment never deletes anything. Plan
-  disk space, or rotate spool files manually after replay.
-- Security: no encryption at rest, and no HTTP authentication or TLS in the
-  example receiver. Keep spool files in an access-controlled local directory and
-  bind the receiver to loopback or a trusted network.
+- Capacity warnings: appends (collectors, example receiver) log a warning to
+  stderr when page usage first crosses 80 % and 95 % of the limit (freelist
+  pages count as free; a level re-arms once usage falls 5 points below it). `status` reports
+  `used_pages`, `used_percent`, `headroom_pages`/`headroom_bytes` and
+  `freelist_count`.
+- Retention: nothing is deleted unless you run `prune` (below). Without it the
+  spool fills up and collection stops at the limit.
+
+## Retention
+
+`akhet prune` deletes records that are safe to drop and prints a JSON report
+(`records`, `first_seq`/`last_seq` deleted, `safe_seq`, `limited_by`,
+`batches`, `page_count`, `freelist_count`, `headroom_pages`).
+
+- **Only acknowledged records.** A record is eligible only if
+  `seq <= min(checkpoint_seq)` over **all** sinks bound in the spool, i.e.
+  every sink has received a 2xx for it. A sink that lags, or that was used once
+  and abandoned, holds back deletion for everyone (`status` shows each sink's
+  `pending_records` and the resulting `prune_safe_seq`). If no sink is bound,
+  nothing is ever deleted.
+- **Minimum age.** `--min-age` (default `24h`; units `s`, `m`, `h`, `d`) keeps
+  records for at least that long after they were appended, by the collector's
+  wall clock (`appended_unix_ns`). Pruning deletes a contiguous prefix: it
+  stops at the first record that is too young or above the minimum checkpoint,
+  so a backwards clock step delays deletion rather than causing it.
+- **Bounded transactions.** Records are deleted in batches of `--batch-size`
+  (default 1000), one `BEGIN IMMEDIATE … COMMIT` each, re-reading the sink
+  checkpoints inside every transaction. Collectors wait for at most one batch
+  (SQLite busy timeout 10 s). A crash rolls back only the batch in progress;
+  committed batches stay deleted. `--dry-run` reports without deleting.
+- **Space reuse, not shrinking.** Deleted pages go to SQLite's freelist and are
+  reused by later appends before the file grows, so once pruning keeps up,
+  `page_count` stays bounded and the `--max-db-bytes` limit keeps working (the
+  limit counts all pages, free or not; freelist pages count as headroom). The
+  file on disk is never shrunk: Akhet runs no `VACUUM`, because a full VACUUM
+  rewrites the whole database, needs up to twice its size in free disk space
+  and blocks collectors for its duration, and `auto_vacuum` cannot be enabled
+  on an existing spool without one. If you must shrink a file, stop all
+  collectors and replayers first and run `VACUUM` with the `sqlite3` shell.
+- **Journal space.** A delete batch writes the original pages to the rollback
+  journal, outside the database-size limit. Pruning a spool on a completely
+  full filesystem can fail; lower `--batch-size` to reduce journal size.
+- **Periodic pruning.** `replay --follow --prune-interval 10m
+  [--prune-min-age 24h]` prunes at most once per interval from the replayer,
+  using the same rules (minimum over all sinks, not just the replaying one).
+  It is off by default. Several replayers may prune the same spool
+  concurrently; each batch is serialized by SQLite.
+- **Consequences of deleting.** A sink bound *after* records were pruned starts
+  from the oldest remaining record; replay logs a warning naming the first seq
+  it will deliver. Identity deduplication (`event_id`, configured MQTT source
+  identities) only covers records still in the spool: a broker redelivery of an
+  already pruned message is stored again as a new record. Keep `--min-age`
+  longer than any plausible redelivery delay. `seq` stays monotonic after
+  deletes (`AUTOINCREMENT`); it is never reused, so checkpoints remain valid.
+- **Not implemented: segment rotation.** Records are not rotated into sealed
+  segment files. Freelist reuse with bounded delete batches already keeps the
+  file bounded without VACUUM; rotation would mainly allow returning space to
+  the filesystem and archiving segments, and is left as follow-up work.
+- Security: no encryption at rest. Keep spool files in an access-controlled
+  local directory. Without TLS and a token (see Secure replay) bind the
+  receiver to loopback or a trusted network.
 
 ## Observability
 
@@ -276,9 +648,10 @@ The endpoint has no authentication and no TLS. Bind it to loopback
 Readiness, per command:
 
 - `mqtt`: connected (CONNACK received, no connection error since), the
-  subscription confirmed on the current connection (SUBACK granting QoS 1, or
-  CONNACK with an existing session), and the spool not full. Not ready while
-  shutting down.
+  configured filter set active on the current connection (every filter
+  granted QoS 1 by a SUBACK, or already held by an existing session according
+  to the spool's subscription record), and the spool not full. Not ready
+  while shutting down.
 - `modbus`: the most recent poll succeeded and the spool is not full. Not
   ready before the first poll completes. Failed polls are still recorded.
 - `replay`: the receiver identity was fetched and the sink binding verified,
@@ -315,7 +688,7 @@ starts, like the exit-time JSON summaries, which are unchanged):
 | `akhet_spool_last_seq` | gauge | all | Highest committed sequence number (sampled) |
 | `akhet_spool_pending_records{sink}` | gauge | all | Records above each sink's checkpoint (sampled) |
 | `akhet_spool_sample_timestamp_seconds` | gauge | all | Unix time of the last successful spool sample |
-| `akhet_spool_commit_duration_seconds` | histogram | mqtt, modbus | Duration of each collector append (one fsync'd transaction, including spool lock wait); buckets 0.5 ms to 10 s |
+| `akhet_spool_commit_duration_seconds` | histogram | mqtt, modbus | Duration of each collector spool transaction (one fsync; with MQTT group commit one observation per batch); buckets 0.5 ms to 10 s |
 | `akhet_mqtt_messages_received_total` | counter | mqtt | PUBLISH packets received |
 | `akhet_mqtt_messages_committed_total` | counter | mqtt | Messages committed as new records |
 | `akhet_mqtt_source_duplicates_total` | counter | mqtt | Redeliveries recognized by source identity, acknowledged without a new record |
@@ -324,12 +697,15 @@ starts, like the exit-time JSON summaries, which are unchanged):
 | `akhet_mqtt_queue_saturation_events_total` | counter | mqtt | Times the socket-to-spool queue was full and socket reads paused |
 | `akhet_mqtt_dropped_unacknowledged_total` | counter | mqtt | Received messages dropped uncommitted and unacknowledged at shutdown |
 | `akhet_mqtt_qos0_messages_total` | counter | mqtt | Messages delivered at QoS 0 |
+| `akhet_mqtt_commit_transactions_total` | counter | mqtt | Spool transactions used by the collector (group commit: one per batch) |
+| `akhet_mqtt_max_batch_committed` | gauge | mqtt | Largest number of messages committed in one transaction so far |
+| `akhet_mqtt_unmatched_messages_total` | counter | mqtt | Messages whose topic matched none of the configured filters |
 | `akhet_mqtt_connections_total` | counter | mqtt | Successful connections (CONNACK) |
 | `akhet_mqtt_connection_errors_total` | counter | mqtt | Connection errors |
 | `akhet_mqtt_queue_depth` | gauge | mqtt | Messages queued between socket and spool |
 | `akhet_mqtt_queue_capacity` | gauge | mqtt | `--queue-capacity` |
 | `akhet_mqtt_connected` | gauge | mqtt | 1 while connected |
-| `akhet_mqtt_subscribed` | gauge | mqtt | 1 while the QoS 1 subscription is confirmed |
+| `akhet_mqtt_subscribed` | gauge | mqtt | 1 while the configured filter set is active with QoS 1 |
 | `akhet_modbus_polls_total{status}` | counter | modbus | Completed polls, `status` `ok` or `read_failed` |
 | `akhet_modbus_connections_total` | counter | modbus | TCP connections established |
 | `akhet_modbus_last_poll_ok` | gauge | modbus | 1 if the most recent poll succeeded |
@@ -369,6 +745,10 @@ time.
 | 5 | Receiver rejected a record permanently |
 | 6 | Receiver unavailable after bounded retries |
 | 7 | Another replayer holds this sink |
+| 8 | Authentication failed: HTTP 401/403, or a TLS certificate rejected by either side (not retried) |
+
+`akhet morlet` uses the same codes: 3 for sink binding mismatches, 5 for writes
+MorletDB rejects, 6 when the database stays unreachable, 2 for configuration.
 
 ## Verification
 
@@ -389,11 +769,34 @@ during replay; receiver crash after commit; repeated replay without duplicate
 receiver records; conflicting event and source identity; corrupted payload;
 unsupported schema and event format; capacity exhaustion; MQTT disconnects,
 redelivery and queue saturation; acknowledgments not carried across reconnects;
-graceful shutdown leaving uncommitted messages unacknowledged; Modbus timeout,
+graceful shutdown leaving uncommitted messages unacknowledged; several topic
+filters with redelivery on two unrelated topics after a reconnect and after a
+crash, and adding/removing filters on an existing session; Modbus timeout,
 exception and reconnect with explicit failed observations; concurrent-replayer
-exclusion and sink binding; TLS with a trusted and an untrusted CA; metrics
-and readiness scraped from running collectors and replay (counters move,
-readiness flips as broker, device and receiver appear or disappear).
+exclusion and sink binding; MQTT TLS with a trusted and an untrusted CA;
+replay over TLS with a trusted CA, an untrusted CA and a wrong host name;
+mutual TLS with a valid, a foreign and no client certificate; missing and
+wrong tokens (401, checkpoint unchanged); refusal to send a token over plain
+HTTP without the opt-in; malformed and unsupported HTTP requests; payload
+decoding of multi-group batches (bit-exact values) and explicit issues for
+malformed payloads; grid placement with jitter, gaps, duplicates, conflicts,
+out-of-order samples, rate estimation and rate changes; context timelines with repeated values, redelivered and
+late contradicting observations, rebuilt identically from the spool; pruning
+limited by the slowest sink, by the minimum age and by having no sink; reads,
+`verify`, `status` and replay after early records are gone; freelist reuse
+under the size limit after a full spool is pruned; crashes inside a prune
+transaction and between batches (`prune.before_commit`,
+`prune.after_commit`) followed by `verify`; metrics and readiness scraped from
+running collectors and replay (counters move, readiness flips as broker,
+device and receiver appear or disappear).
+
+A short bounded-size soak test appends, replays to the example receiver and
+prunes in cycles, writing several times the size limit through a 128 KiB spool
+and asserting that `page_count` stops growing. Run it longer with:
+
+```sh
+AKHET_SOAK_CYCLES=500 cargo test --locked --test retention soak -- --nocapture
+```
 
 Against an external broker (CI runs this with Mosquitto 2):
 
@@ -401,17 +804,46 @@ Against an external broker (CI runs this with Mosquitto 2):
 AKHET_TEST_BROKER_PORT=1883 cargo test --locked --test mqtt_external -- --ignored
 ```
 
+Group commit and batched replay have their own crash tests: a kill inside a
+batch transaction (`abort:collector.batch_partial`, nothing stored, everything
+redelivered), a kill after a batch commit before its acknowledgments (whole
+batch redelivered), and batched replay killed after the remote commit or after
+the checkpoint, plus a conflict in the middle of a batch.
+
+Against MorletDB (CI runs this with the published pg_morlet image; see the
+header of `tests/morlet.rs`):
+
+```sh
+AKHET_TEST_MORLET_URL=postgresql://morlet:morlet-test@127.0.0.1:54339/morlet \
+  cargo test --locked --test morlet -- --ignored --test-threads=1
+```
+
 Not covered: power-failure durability, broker restarts with persistence, real
-Modbus devices, long-duration soak tests, throughput or latency benchmarks.
+Modbus devices, multi-day soak tests.
+
+### Benchmark
+
+```sh
+cargo run --release --locked --example throughput            # about 5 minutes
+cargo run --release --locked --example throughput -- --runs 1 --quick
+```
+
+It measures MQTT ingest (messages/s, payload MB/s, commit latency p50/p99,
+with and without group commit) and replay records/s (single vs batch) on
+loopback, with a payload shaped like 8 channels × 4000 samples per 100 ms as
+JSON. Results, settings and hardware are in
+[docs/benchmarks.md](docs/benchmarks.md). They come from one development
+machine (macOS, `F_FULLFSYNC`); numbers for x86_64 and arm64 Linux edge
+hardware are still missing.
 
 ## Scope boundaries
 
-- No MorletDB integration. Mapping these generic events into MorletDB needs an
-  explicit contract for payload schema, units, sampling rate, source clock,
-  recording identity and gaps; irregular Modbus polls are not a uniform
-  waveform.
+- The MorletDB sink handles MQTT payloads decoded by rules. Irregular Modbus
+  polls are not a uniform waveform and are not written to MorletDB.
 - No ML, adaptive discarding, Parquet conversion, custom storage engine,
-  retention/deletion, fleet management or performance claims.
+  segment rotation, fleet management or performance claims beyond the
+  measurements in docs/benchmarks.md. Deletion exists only as the explicit,
+  acknowledgment-gated `prune` described above.
 
 ## License
 

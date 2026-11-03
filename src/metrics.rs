@@ -64,12 +64,19 @@ pub struct MqttCounters {
     pub connections: AtomicU64,
     pub connection_errors: AtomicU64,
     pub qos0: AtomicU64,
+    /// Spool transactions used by the collector (group commit: one per batch).
+    pub transactions: AtomicU64,
+    /// Largest number of messages committed in one transaction.
+    pub max_batch: AtomicU64,
+    /// Messages whose topic matched none of the configured filters.
+    pub unmatched: AtomicU64,
     /// Messages currently queued between the socket and the committer.
     pub queue_depth: AtomicU64,
     pub queue_capacity: AtomicU64,
     /// CONNACK received and no connection error since.
     pub connected: AtomicBool,
-    /// SUBACK granted QoS 1, or CONNACK reported an existing session.
+    /// The configured filter set is active (SUBACK with QoS 1, or already
+    /// held by an existing session per the spool record).
     pub subscribed: AtomicBool,
 }
 
@@ -276,8 +283,8 @@ impl Metrics {
 
     /// Readiness: `Ok(())` or the list of failing conditions.
     ///
-    /// - mqtt: connected (CONNACK, no connection error since), subscription
-    ///   confirmed (SUBACK with QoS 1, or CONNACK with an existing session),
+    /// - mqtt: connected (CONNACK, no connection error since), configured
+    ///   filter set active (SUBACK with QoS 1, or held by an existing session),
     ///   and the spool is not full.
     /// - modbus: the most recent poll succeeded and the spool is not full.
     /// - replay: the receiver identity was fetched and the sink binding
@@ -375,7 +382,7 @@ impl Metrics {
 
     fn render_mqtt(&self, o: &mut String) {
         let m = &self.mqtt;
-        let counters: [(&str, &str, &AtomicU64); 10] = [
+        let counters: [(&str, &str, &AtomicU64); 12] = [
             (
                 "akhet_mqtt_messages_received_total",
                 "PUBLISH packets received from the broker.",
@@ -390,6 +397,16 @@ impl Metrics {
                 "akhet_mqtt_source_duplicates_total",
                 "Redeliveries recognized by source identity and acknowledged without a new record.",
                 &m.source_duplicates,
+            ),
+            (
+                "akhet_mqtt_commit_transactions_total",
+                "Spool transactions used by the collector (group commit: one per batch).",
+                &m.transactions,
+            ),
+            (
+                "akhet_mqtt_unmatched_messages_total",
+                "Messages whose topic matched none of the configured filters (stored with an empty subscription).",
+                &m.unmatched,
             ),
             (
                 "akhet_mqtt_acks_enqueued_total",
@@ -430,6 +447,13 @@ impl Metrics {
         for (name, help, a) in counters {
             single(o, name, "counter", help, load(a));
         }
+        single(
+            o,
+            "akhet_mqtt_max_batch_committed",
+            "gauge",
+            "Largest number of messages committed in one spool transaction so far.",
+            load(&m.max_batch),
+        );
         single(
             o,
             "akhet_mqtt_queue_depth",
