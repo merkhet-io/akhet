@@ -162,6 +162,26 @@ enum Command {
         summary_only: bool,
     },
     /// Run the example HTTP receiver (stores into its own spool file).
+    /// Place decoded samples on uniform sample grids (read-only).
+    ///
+    /// Prints recording starts/ends, timing issues and (with --chunks) chunks
+    /// as JSON lines, then a summary with a timing report per channel. The
+    /// streams are finished at the end of the selected records.
+    Grid {
+        /// Decoder config file (JSON); per-rule `timing` sets rate/tolerance.
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Also print chunks with their timing evidence.
+        #[arg(long)]
+        chunks: bool,
+        /// Include sample values in printed chunks.
+        #[arg(long, requires = "chunks")]
+        samples: bool,
+    },
     Receive {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
@@ -421,6 +441,29 @@ fn main() -> ExitCode {
                 Err(e) => fail(spool_exit(&e), e),
             }
         }
+        Command::Grid {
+            config,
+            after,
+            limit,
+            chunks,
+            samples,
+        } => {
+            let cfg = match akhet::decode::DecoderConfig::load(&config) {
+                Ok(c) => c,
+                Err(e) => return fail(2, e),
+            };
+            let spool = match open() {
+                Ok(s) => s,
+                Err(e) => return fail(spool_exit(&e), e),
+            };
+            match grid_spool(&spool, &cfg, after, limit, chunks, samples) {
+                Ok(summary) => {
+                    print_json(&summary);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(spool_exit(&e), e),
+            }
+        }
         Command::Receive { listen, db } => {
             let spool = match Spool::open_with_limits(&db, cli.max_db_bytes, cli.max_event_bytes) {
                 Ok(s) => s,
@@ -527,6 +570,81 @@ fn decode_spool(
         }
     }
     Ok(sum)
+}
+
+fn print_grid_output(seq: i64, o: &akhet::timing::GridOutput, chunks: bool, samples: bool) {
+    use akhet::timing::GridOutput;
+    match o {
+        GridOutput::Chunk(c) if chunks => {
+            let mut v = serde_json::to_value(o).unwrap_or_default();
+            if !samples {
+                v["values"] = serde_json::Value::Null;
+                v["sample_count"] = c.values.len().into();
+            }
+            print_json(&serde_json::json!({"seq": seq, "output": v}));
+        }
+        GridOutput::Chunk(_) => {}
+        other => print_json(&serde_json::json!({"seq": seq, "output": other})),
+    }
+}
+
+fn grid_spool(
+    spool: &Spool,
+    cfg: &akhet::decode::DecoderConfig,
+    mut after: i64,
+    limit: Option<usize>,
+    chunks: bool,
+    samples: bool,
+) -> Result<serde_json::Value, SpoolError> {
+    use akhet::timing::ChannelGrid;
+    use std::collections::BTreeMap;
+    let mut grids: BTreeMap<akhet::decode::ChannelId, ChannelGrid> = BTreeMap::new();
+    let mut decode_issues = 0u64;
+    let mut last_seq = after;
+    let mut left = limit.unwrap_or(usize::MAX);
+    while left > 0 {
+        let batch = spool.read_after(after, left.min(256))?;
+        let Some(last) = batch.last() else { break };
+        after = last.seq;
+        left -= batch.len();
+        for r in batch {
+            last_seq = r.seq;
+            let ev = akhet::event::decode(&r.body)?;
+            let Some(d) = cfg.decode_event(&ev) else {
+                continue;
+            };
+            decode_issues += d.issues.len() as u64;
+            let akhet::event::EventData::MqttMessage(m) = &ev.data else {
+                continue;
+            };
+            let spec = cfg
+                .rule_for(&m.topic)
+                .and_then(|r| r.timing.clone())
+                .unwrap_or_default();
+            for b in &d.batches {
+                let g = grids.entry(b.channel.clone()).or_insert_with(|| {
+                    ChannelGrid::new(b.channel.key(), spec.clone())
+                        .expect("timing spec validated with the config")
+                });
+                for o in g.push(&b.timestamps_unix_ns, &b.values) {
+                    print_grid_output(r.seq, &o, chunks, samples);
+                }
+            }
+        }
+    }
+    let mut channels = Vec::new();
+    for (id, mut g) in grids {
+        for o in g.finish() {
+            print_grid_output(last_seq, &o, chunks, samples);
+        }
+        channels.push(serde_json::json!({"channel": id, "report": g.report()}));
+    }
+    Ok(serde_json::json!({
+        "summary": true,
+        "last_seq": last_seq,
+        "decode_issues": decode_issues,
+        "channels": channels,
+    }))
 }
 
 fn collect_fail(e: CollectError) -> ExitCode {
