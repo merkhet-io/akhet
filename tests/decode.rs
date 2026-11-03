@@ -14,6 +14,7 @@ fn mqtt_event(topic: &str, payload: &[u8]) -> Event {
             broker: "127.0.0.1:1883".into(),
             client_id: "test".into(),
             subscription: "#".into(),
+            subscriptions: vec!["#".into()],
             topic: topic.into(),
             qos: 1,
             retain: false,
