@@ -2,6 +2,7 @@
 //! observations. See README.md for delivery semantics and limits.
 
 pub mod adapters;
+pub mod decode;
 pub mod event;
 pub mod faults;
 pub mod receiver;

@@ -112,6 +112,50 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
 (`connect`|`timeout`|`transport`|`exception`|`response_length`|`resolve`) and
 `message`. Failed reads never carry register values.
 
+### Payload decoding (read-only)
+
+`akhet decode --config <file>` maps spooled MQTT payloads to per-channel
+sample batches. It reads the spool and never modifies it: the raw payload bytes
+stay stored exactly as received, and a corrected decoder config can be re-run
+over the same records.
+
+```sh
+akhet --spool data/s.sqlite decode --config examples/decoder.json            # counts and ranges
+akhet --spool data/s.sqlite decode --config examples/decoder.json --samples  # full arrays
+akhet --spool data/s.sqlite decode --config examples/decoder.json --summary-only
+```
+
+Supported shape: one message holds one or more *signal groups*; each group has
+one timestamp array and one value array per signal, all of equal length. The
+config (JSON, `format_version: 1`, see `examples/decoder.json`) has one rule
+per topic filter; the first matching rule applies:
+
+| Field | Meaning |
+|---|---|
+| `topic` | MQTT filter (`+`, `#`) |
+| `source` | Source template: `{topic}`, `{topic.N}` (zero-based level), `{/json/pointer}` into the message |
+| `groups` | Optional JSON pointer to the array of groups; absent = the message is one group |
+| `group` | Group name template; additionally `{group:/pointer}` into the group |
+| `timestamps`, `timestamp_unit` | Pointer to the integer timestamp array; `ns`, `us`, `ms` or `s` since the Unix epoch |
+| `signals` | `{"map": "/pointer"}` (object of name → array) or `{"list": [{"name", "pointer"}]}` |
+| `units`, `default_unit` | Unit per signal name; a signal without a unit is an issue, never unlabelled |
+| `metadata` | Static JSON object attached to every channel |
+
+A channel is identified by `(source, group, signal)`. Validation per group:
+integer timestamps, strictly increasing within the group, equal array lengths,
+finite numeric values, a configured unit, and no channel twice in one message.
+Every failure is an explicit issue with its kind (`no_matching_rule`,
+`not_json`, `bad_structure`, `bad_template`, `bad_timestamp`,
+`non_monotonic_timestamps`, `length_mismatch`, `non_finite_value`, `no_unit`,
+`too_large`, `duplicate_channel`), rule, topic, group index, signal and sample
+index. A group with an issue yields no batches, so a group is never partly
+decoded; other groups of the same message still decode. Values are parsed as
+IEEE 754 float64 from the JSON text and are bit-exact for numbers that
+round-trip through float64.
+
+Decoding does not interpret timing: it reports the publisher's timestamps
+as given. Converting timestamps to a uniform sample grid is a separate step.
+
 ## Delivery semantics
 
 ### MQTT → spool: at-least-once, acknowledged after durable commit
@@ -286,7 +330,9 @@ unsupported schema and event format; capacity exhaustion; MQTT disconnects,
 redelivery and queue saturation; acknowledgments not carried across reconnects;
 graceful shutdown leaving uncommitted messages unacknowledged; Modbus timeout,
 exception and reconnect with explicit failed observations; concurrent-replayer
-exclusion and sink binding; TLS with a trusted and an untrusted CA.
+exclusion and sink binding; TLS with a trusted and an untrusted CA; payload
+decoding of multi-group batches (bit-exact values) and explicit issues for
+malformed payloads.
 
 Against an external broker (CI runs this with Mosquitto 2):
 
@@ -299,9 +345,9 @@ Modbus devices, long-duration soak tests, throughput or latency benchmarks.
 
 ## Scope boundaries
 
-- No MorletDB integration. Mapping these generic events into MorletDB needs an
-  explicit contract for payload schema, units, sampling rate, source clock,
-  recording identity and gaps; irregular Modbus polls are not a uniform
+- No MorletDB integration yet. `decode` supplies the payload schema, units and
+  channel identity; sampling rate, source clock, recording identity and gaps
+  still need an explicit contract. Irregular Modbus polls are not a uniform
   waveform.
 - No ML, adaptive discarding, Parquet conversion, custom storage engine,
   retention/deletion, fleet management or performance claims.
