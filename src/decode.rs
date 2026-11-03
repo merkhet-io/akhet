@@ -750,40 +750,17 @@ fn render(t: &str, topic: &str, root: &Value, group: Option<&Value>) -> Result<S
     Ok(s)
 }
 
-/// Validate an MQTT topic filter (MQTT 3.1.1 section 4.7).
+/// Validate an MQTT topic filter (shared with the MQTT adapter).
 pub fn validate_filter(filter: &str) -> Result<(), String> {
-    if filter.is_empty() {
-        return Err("topic filter must be non-empty".into());
-    }
-    let levels: Vec<&str> = filter.split('/').collect();
-    for (i, l) in levels.iter().enumerate() {
-        if l.contains('#') && (*l != "#" || i != levels.len() - 1) {
-            return Err(format!("'#' must be a whole, last level in {filter:?}"));
-        }
-        if l.contains('+') && *l != "+" {
-            return Err(format!("'+' must be a whole level in {filter:?}"));
-        }
-    }
-    Ok(())
+    crate::adapters::mqtt::validate_filter(filter)
+        .map_err(|m| format!("topic filter {filter:?}: {m}"))
 }
 
-/// MQTT topic filter matching with `+` (one level) and `#` (rest, including
-/// the parent level). Topics starting with `$` do not match leading wildcards.
+/// MQTT topic filter matching (shared with the MQTT adapter): `+` one level,
+/// `#` the rest including the parent level; `$` topics do not match leading
+/// wildcards.
 pub fn topic_matches(filter: &str, topic: &str) -> bool {
-    if topic.starts_with('$') && (filter.starts_with('+') || filter.starts_with('#')) {
-        return false;
-    }
-    let mut f = filter.split('/');
-    let mut t = topic.split('/');
-    loop {
-        match (f.next(), t.next()) {
-            (Some("#"), _) => return true,
-            (Some("+"), Some(_)) => {}
-            (Some(a), Some(b)) if a == b => {}
-            (None, None) => return true,
-            _ => return false,
-        }
-    }
+    crate::adapters::mqtt::filter_matches(filter, topic)
 }
 
 #[cfg(test)]

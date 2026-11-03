@@ -24,6 +24,10 @@
 //!   bumps the generation and purges stale queued PUBACKs on disconnect). Packet
 //!   ids are only meaningful within one connection/session.
 //!
+//! Subscriptions: all configured filters go into one SUBSCRIBE. With an
+//! existing session only the difference to the filter set recorded in the
+//! spool is (un)subscribed, see [`SubscriptionRecord`].
+//!
 //! Delivery: at-least-once into the spool, provided the broker keeps the
 //! persistent session (clean_session=false) and its queued messages. A crash or
 //! disconnect after commit but before the PUBACK reaches the broker causes
@@ -37,8 +41,10 @@ use crate::spool::{AppendOutcome, SourceClaim};
 use base64::Engine as _;
 use rumqttc::{
     AsyncClient, ConnectReturnCode, ConnectionError, Event as MqEvent, EventLoop, MqttOptions,
-    Outgoing, Packet, Publish, QoS, StateError, SubscribeReasonCode, TlsConfiguration, Transport,
+    Outgoing, Packet, Publish, QoS, StateError, SubscribeFilter, SubscribeReasonCode,
+    TlsConfiguration, Transport,
 };
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -75,7 +81,9 @@ pub struct MqttConfig {
     pub host: String,
     pub port: u16,
     pub client_id: String,
-    pub topic: String,
+    /// Topic filters, subscribed with QoS 1 in one SUBSCRIBE. Order matters
+    /// only for the `subscription` field of events (first matching filter).
+    pub topics: Vec<String>,
     pub tls: Option<TlsSettings>,
     pub username: Option<String>,
     pub password: Option<String>,
@@ -90,19 +98,25 @@ pub struct MqttConfig {
     pub reconnect_max: Duration,
     /// Maximum time to flush acknowledgments and disconnect on shutdown.
     pub shutdown_grace: Duration,
-    /// Notified each time the subscription is known to be active (SUBACK
-    /// with QoS 1, or CONNACK with an existing session). Used by tests and
-    /// embedders to avoid racing the subscription.
+    /// Notified each time every configured filter is known to be subscribed
+    /// (SUBACK with QoS 1 for each filter requested on this connection, or
+    /// CONNACK with an existing session already holding them). Removals of
+    /// filters no longer configured may still be in progress. Used by tests
+    /// and embedders to avoid racing the subscription.
     pub ready: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl MqttConfig {
     pub fn new(host: &str, port: u16, client_id: &str, topic: &str) -> Self {
+        Self::with_topics(host, port, client_id, vec![topic.to_string()])
+    }
+
+    pub fn with_topics(host: &str, port: u16, client_id: &str, topics: Vec<String>) -> Self {
         MqttConfig {
             host: host.into(),
             port,
             client_id: client_id.into(),
-            topic: topic.into(),
+            topics,
             tls: None,
             username: None,
             password: None,
@@ -123,8 +137,18 @@ impl MqttConfig {
         if self.client_id.is_empty() || self.client_id.len() > 256 {
             return c("client id must be 1..=256 bytes (persistent sessions need a stable id)");
         }
-        if self.topic.is_empty() {
-            return c("topic filter must be non-empty");
+        if self.topics.is_empty() {
+            return c("at least one topic filter is required");
+        }
+        let mut seen = BTreeSet::new();
+        for t in &self.topics {
+            validate_filter(t)
+                .map_err(|m| CollectError::Config(format!("topic filter {t:?}: {m}")))?;
+            if !seen.insert(t.as_str()) {
+                return Err(CollectError::Config(format!(
+                    "duplicate topic filter {t:?}"
+                )));
+            }
         }
         if self.queue_capacity == 0 || self.queue_capacity > 65_535 {
             return c("queue capacity must be 1..=65535");
@@ -132,8 +156,11 @@ impl MqttConfig {
         if self.max_payload_bytes == 0 || self.max_payload_bytes > 64 * 1024 * 1024 {
             return c("max payload bytes must be 1..=67108864");
         }
-        // base64 expansion plus topic and JSON envelope must fit an event.
-        let worst = self.max_payload_bytes.div_ceil(3) * 4 + MAX_TOPIC_BYTES * 2 + 4096;
+        // base64 expansion plus topic, matching filters (`subscription` and
+        // `subscriptions`) and JSON envelope must fit an event.
+        let filter_bytes: usize = self.topics.iter().map(|t| t.len() + 3).sum();
+        let worst =
+            self.max_payload_bytes.div_ceil(3) * 4 + MAX_TOPIC_BYTES * 2 + filter_bytes * 4 + 4096;
         if worst > max_event_bytes {
             return Err(CollectError::Config(format!(
                 "--max-payload-bytes {} can encode to {worst} bytes, above --max-event-bytes {max_event_bytes}",
@@ -155,6 +182,51 @@ impl MqttConfig {
     }
 }
 
+/// Check an MQTT 3.1.1 topic filter (section 4.7): non-empty, at most 65535
+/// bytes, no NUL, `#` only as the whole last level, `+` only as a whole level.
+pub fn validate_filter(filter: &str) -> Result<(), &'static str> {
+    if filter.is_empty() {
+        return Err("must be non-empty");
+    }
+    if filter.len() > MAX_TOPIC_BYTES {
+        return Err("longer than 65535 bytes");
+    }
+    if filter.contains('\0') {
+        return Err("contains NUL");
+    }
+    let levels: Vec<&str> = filter.split('/').collect();
+    for (i, level) in levels.iter().enumerate() {
+        if level.contains('#') && (*level != "#" || i + 1 != levels.len()) {
+            return Err("'#' must be the whole last level");
+        }
+        if level.contains('+') && *level != "+" {
+            return Err("'+' must be a whole level");
+        }
+    }
+    Ok(())
+}
+
+/// MQTT 3.1.1 topic matching (section 4.7): `+` matches exactly one level,
+/// a trailing `#` matches the parent level and any number of child levels.
+/// Filters starting with a wildcard do not match topics starting with `$`.
+/// `filter` must be valid (see [`validate_filter`]).
+pub fn filter_matches(filter: &str, topic: &str) -> bool {
+    if topic.starts_with('$') && (filter.starts_with('+') || filter.starts_with('#')) {
+        return false;
+    }
+    let mut f = filter.split('/');
+    let mut t = topic.split('/');
+    loop {
+        match (f.next(), t.next()) {
+            (Some("#"), _) => return true,
+            (Some("+"), Some(_)) => {}
+            (Some(a), Some(b)) if a == b => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
 /// Counters reported at shutdown.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct MqttSummary {
@@ -168,6 +240,9 @@ pub struct MqttSummary {
     pub connections: u64,
     pub connection_errors: u64,
     pub qos0_messages: u64,
+    /// Messages whose topic matches none of the configured filters (e.g.
+    /// queued by the broker for a filter that has since been removed).
+    pub unmatched_messages: u64,
 }
 
 #[derive(Default)]
@@ -182,6 +257,7 @@ struct Counters {
     connections: AtomicU64,
     connection_errors: AtomicU64,
     qos0: AtomicU64,
+    unmatched: AtomicU64,
 }
 
 impl Counters {
@@ -198,6 +274,7 @@ impl Counters {
             connections: g(&self.connections),
             connection_errors: g(&self.connection_errors),
             qos0_messages: g(&self.qos0),
+            unmatched_messages: g(&self.unmatched),
         }
     }
 }
@@ -264,11 +341,17 @@ fn build_tls(t: &TlsSettings) -> Result<TlsConfiguration, CollectError> {
 
 fn options(cfg: &MqttConfig) -> Result<MqttOptions, CollectError> {
     let mut o = MqttOptions::new(cfg.client_id.clone(), cfg.host.clone(), cfg.port);
+    // Outgoing: the one SUBSCRIBE carrying every filter (2 + len + 1 each,
+    // plus packet id and fixed header) must fit.
+    let subscribe_bytes: usize = cfg.topics.iter().map(|t| t.len() + 3).sum::<usize>() + 16;
     o.set_clean_session(false)
         .set_manual_acks(true)
         .set_keep_alive(cfg.keep_alive)
         // Packet = topic (2 + up to 65535) + packet id (2) + payload.
-        .set_max_packet_size(cfg.max_payload_bytes + MAX_TOPIC_BYTES + 4, 64 * 1024);
+        .set_max_packet_size(
+            cfg.max_payload_bytes + MAX_TOPIC_BYTES + 4,
+            subscribe_bytes.max(64 * 1024),
+        );
     if let Some(user) = &cfg.username {
         o.set_credentials(user.clone(), cfg.password.clone().unwrap_or_default());
     }
@@ -319,10 +402,17 @@ fn source_identity(
 
 fn to_event(cfg: &MqttConfig, r: &Received) -> (Event, Option<SourceClaim>) {
     let p = &r.publish;
+    let subscriptions: Vec<String> = cfg
+        .topics
+        .iter()
+        .filter(|f| filter_matches(f, &p.topic))
+        .cloned()
+        .collect();
     let mut msg = MqttMessage {
         broker: format!("{}:{}", cfg.host, cfg.port),
         client_id: cfg.client_id.clone(),
-        subscription: cfg.topic.clone(),
+        subscription: subscriptions.first().cloned().unwrap_or_default(),
+        subscriptions,
         topic: p.topic.clone(),
         qos: p.qos as u8,
         retain: p.retain,
@@ -345,6 +435,243 @@ fn to_event(cfg: &MqttConfig, r: &Received) -> (Event, Option<SourceClaim>) {
     let mut ev = Event::new(EventData::MqttMessage(msg), r.received_unix_ns);
     ev.source_identity = identity;
     (ev, claim)
+}
+
+/// What the spool records about the broker session's subscriptions, stored
+/// in the spool `meta` table under [`subscription_key`].
+///
+/// Invariant (kept by writing before and after every change): when the
+/// broker reports an existing session, it holds every filter in `confirmed`
+/// and no filter outside `possible`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SubscriptionRecord {
+    /// Filters the broker confirmed with a QoS 1 SUBACK.
+    pub confirmed: BTreeSet<String>,
+    /// Filters the session may hold (a SUBSCRIBE may have reached the
+    /// broker, or an UNSUBSCRIBE may not have). Superset of `confirmed`.
+    pub possible: BTreeSet<String>,
+}
+
+/// `meta` key for the subscription record of one broker address and client id.
+pub fn subscription_key(cfg: &MqttConfig) -> String {
+    format!(
+        "mqtt_subscriptions {}",
+        serde_json::json!([format!("{}:{}", cfg.host, cfg.port), cfg.client_id])
+    )
+}
+
+/// Subscription changes to make after CONNACK.
+#[derive(Debug, PartialEq, Eq)]
+struct SubscriptionPlan {
+    /// Filters to SUBSCRIBE (configuration order), in one packet.
+    subscribe: Vec<String>,
+    /// Filters to UNSUBSCRIBE.
+    unsubscribe: Vec<String>,
+    /// Record to store before sending any request.
+    before: SubscriptionRecord,
+    /// Record once every request was acknowledged (stored directly when
+    /// there is nothing to request).
+    after: SubscriptionRecord,
+}
+
+fn plan_subscriptions(
+    topics: &[String],
+    session_present: bool,
+    known: Option<&SubscriptionRecord>,
+) -> SubscriptionPlan {
+    let target: BTreeSet<String> = topics.iter().cloned().collect();
+    let after = SubscriptionRecord {
+        confirmed: target.clone(),
+        possible: target.clone(),
+    };
+    match known.filter(|_| session_present) {
+        // No session at the broker: it holds nothing. Unknown session state:
+        // subscribe to everything (idempotent; re-sends retained messages)
+        // and remove nothing, since we do not know what to remove.
+        None => SubscriptionPlan {
+            subscribe: topics.to_vec(),
+            unsubscribe: Vec::new(),
+            before: SubscriptionRecord {
+                confirmed: BTreeSet::new(),
+                possible: target,
+            },
+            after,
+        },
+        Some(k) => SubscriptionPlan {
+            subscribe: topics
+                .iter()
+                .filter(|t| !k.confirmed.contains(*t))
+                .cloned()
+                .collect(),
+            unsubscribe: k.possible.difference(&target).cloned().collect(),
+            before: SubscriptionRecord {
+                confirmed: k.confirmed.intersection(&target).cloned().collect(),
+                possible: k.possible.union(&target).cloned().collect(),
+            },
+            after,
+        },
+    }
+}
+
+/// Per-run subscription bookkeeping, driven by the poll loop.
+///
+/// The configured set is active once every configured filter is confirmed
+/// (SUBACK, or already confirmed in an existing session). Removals finish
+/// when their UNSUBACKs arrive; capture does not wait for them, and until
+/// then the record keeps the removed filters as `possible` so that the next
+/// start retries the UNSUBSCRIBE.
+struct Subscriptions {
+    spool: AsyncSpool,
+    key: String,
+    /// Record as last read from or written to the spool.
+    known: Option<SubscriptionRecord>,
+    /// Filters of the outstanding SUBSCRIBE, in request order.
+    pending_subscribe: Option<Vec<String>>,
+    /// Filters being unsubscribed (one UNSUBSCRIBE each) and how many
+    /// UNSUBACKs are still outstanding.
+    pending_unsubscribe: Vec<String>,
+    unsubacks_outstanding: usize,
+}
+
+impl Subscriptions {
+    async fn load(cfg: &MqttConfig, spool: AsyncSpool) -> Result<Self, CollectError> {
+        let key = subscription_key(cfg);
+        let known = match spool.meta_get(&key).await? {
+            None => None,
+            Some(v) => match serde_json::from_str::<SubscriptionRecord>(&v) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    log(format!(
+                        "mqtt: ignoring unreadable subscription record in spool ({e})"
+                    ));
+                    None
+                }
+            },
+        };
+        Ok(Subscriptions {
+            spool,
+            key,
+            known,
+            pending_subscribe: None,
+            pending_unsubscribe: Vec::new(),
+            unsubacks_outstanding: 0,
+        })
+    }
+
+    async fn store(&mut self, rec: SubscriptionRecord) -> Result<(), CollectError> {
+        if self.known.as_ref() == Some(&rec) {
+            return Ok(());
+        }
+        let v = serde_json::to_string(&rec).expect("record serialization cannot fail");
+        self.spool.meta_set(&self.key, &v).await?;
+        self.known = Some(rec);
+        Ok(())
+    }
+
+    /// Start the subscription changes for a new connection. Returns true when
+    /// every configured filter is already held (nothing to subscribe).
+    async fn on_connack(
+        &mut self,
+        cfg: &MqttConfig,
+        client: &AsyncClient,
+        session_present: bool,
+    ) -> Result<bool, CollectError> {
+        self.pending_subscribe = None;
+        self.pending_unsubscribe.clear();
+        self.unsubacks_outstanding = 0;
+        if session_present && self.known.is_none() {
+            log(
+                "mqtt: the spool has no record of this session's subscriptions; subscribing to all \
+                 configured filters (the broker re-sends retained messages for them)",
+            );
+        }
+        let plan = plan_subscriptions(&cfg.topics, session_present, self.known.as_ref());
+        if plan.subscribe.is_empty() && plan.unsubscribe.is_empty() {
+            self.store(plan.after).await?;
+            return Ok(true);
+        }
+        // Durable before the broker can act on any request.
+        self.store(plan.before).await?;
+        if !plan.unsubscribe.is_empty() {
+            log(format!(
+                "mqtt: unsubscribing from filters no longer configured: {:?}",
+                plan.unsubscribe
+            ));
+        }
+        for t in &plan.unsubscribe {
+            client
+                .try_unsubscribe(t.clone())
+                .map_err(|e| CollectError::Fatal(format!("unsubscribe request failed: {e}")))?;
+        }
+        self.unsubacks_outstanding = plan.unsubscribe.len();
+        self.pending_unsubscribe = plan.unsubscribe;
+        if plan.subscribe.is_empty() {
+            return Ok(true);
+        }
+        let filters = plan
+            .subscribe
+            .iter()
+            .map(|t| SubscribeFilter::new(t.clone(), QoS::AtLeastOnce));
+        client
+            .try_subscribe_many(filters)
+            .map_err(|e| CollectError::Fatal(format!("subscribe request failed: {e}")))?;
+        self.pending_subscribe = Some(plan.subscribe);
+        Ok(false)
+    }
+
+    /// Check every SUBACK return code. Returns true when the configured set
+    /// became active.
+    async fn on_suback(
+        &mut self,
+        cfg: &MqttConfig,
+        return_codes: &[SubscribeReasonCode],
+    ) -> Result<bool, CollectError> {
+        let Some(filters) = self.pending_subscribe.take() else {
+            log("mqtt: ignoring unexpected SUBACK");
+            return Ok(false);
+        };
+        if return_codes.len() != filters.len() {
+            return Err(CollectError::Fatal(format!(
+                "broker answered {} SUBACK return codes for {} topic filters",
+                return_codes.len(),
+                filters.len()
+            )));
+        }
+        for (code, filter) in return_codes.iter().zip(&filters) {
+            if *code != SubscribeReasonCode::Success(QoS::AtLeastOnce) {
+                return Err(CollectError::Fatal(format!(
+                    "broker granted {code:?} for {filter:?}; QoS 1 is required for at-least-once capture"
+                )));
+            }
+        }
+        log(format!("mqtt: subscribed to {filters:?} with QoS 1"));
+        let mut rec = self.known.clone().unwrap_or_default();
+        rec.confirmed = cfg.topics.iter().cloned().collect();
+        rec.possible.extend(rec.confirmed.iter().cloned());
+        self.store(rec).await?;
+        Ok(true)
+    }
+
+    async fn on_unsuback(&mut self) -> Result<(), CollectError> {
+        if self.unsubacks_outstanding == 0 {
+            log("mqtt: ignoring unexpected UNSUBACK");
+            return Ok(());
+        }
+        self.unsubacks_outstanding -= 1;
+        if self.unsubacks_outstanding > 0 {
+            return Ok(());
+        }
+        // Without relying on UNSUBACK order: only record the removal once
+        // every UNSUBSCRIBE of this connection was acknowledged.
+        let removed = std::mem::take(&mut self.pending_unsubscribe);
+        log(format!("mqtt: unsubscribed from {removed:?}"));
+        let mut rec = self.known.clone().unwrap_or_default();
+        for f in &removed {
+            rec.possible.remove(f);
+            rec.confirmed.remove(f);
+        }
+        self.store(rec).await
+    }
 }
 
 fn fatal_connection_error(e: &ConnectionError) -> Option<String> {
@@ -388,6 +715,7 @@ pub async fn run(
     let (queue_tx, queue_rx) = mpsc::channel::<Received>(cfg.queue_capacity);
     let (ack_tx, ack_rx) = mpsc::unbounded_channel::<AckNotice>();
 
+    let subscriptions = Subscriptions::load(&cfg, spool.clone()).await?;
     let committer = tokio::spawn(committer(
         cfg.clone(),
         spool,
@@ -416,6 +744,7 @@ pub async fn run(
         stopping,
         committer,
         acker,
+        subscriptions,
     )
     .await;
 
@@ -436,6 +765,25 @@ fn set_fatal(fatal: &Mutex<Option<CollectError>>, e: CollectError, stop: &Stop) 
     stop.trigger();
 }
 
+/// Notify readiness once the configured set is active; stop on errors.
+fn subscription_progress(
+    cfg: &MqttConfig,
+    active: Result<bool, CollectError>,
+    fatal: &Mutex<Option<CollectError>>,
+    stop: &Stop,
+) {
+    match active {
+        Ok(true) => {
+            log(format!("mqtt: subscription active for {:?}", cfg.topics));
+            if let Some(r) = &cfg.ready {
+                r.notify_one();
+            }
+        }
+        Ok(false) => {}
+        Err(e) => set_fatal(fatal, e, stop),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn poll_loop(
     cfg: &MqttConfig,
@@ -449,6 +797,7 @@ async fn poll_loop(
     stopping: Arc<AtomicBool>,
     committer: tokio::task::JoinHandle<()>,
     acker: tokio::task::JoinHandle<()>,
+    mut subscriptions: Subscriptions,
 ) {
     let mut queue_tx = Some(queue_tx);
     let mut backoff = cfg.reconnect_min;
@@ -511,42 +860,22 @@ async fn poll_loop(
                     "mqtt: connected to {}:{} as {:?} (session_present={})",
                     cfg.host, cfg.port, cfg.client_id, ack.session_present
                 ));
-                if ack.session_present {
-                    if let Some(r) = &cfg.ready {
-                        r.notify_one();
-                    }
-                } else {
-                    // Broker has no session for us: (re)subscribe. With an
-                    // existing session the subscription persists, and
-                    // re-subscribing would re-send retained messages.
-                    if let Err(e) = client.try_subscribe(cfg.topic.clone(), QoS::AtLeastOnce) {
-                        set_fatal(
-                            &fatal,
-                            CollectError::Fatal(format!("subscribe request failed: {e}")),
-                            &stop,
-                        );
-                    }
-                }
+                // Without a session the broker holds no subscriptions: subscribe
+                // to every filter. With one, only apply the difference to what
+                // the spool recorded, because re-subscribing would re-send
+                // retained messages.
+                let active = subscriptions
+                    .on_connack(cfg, &client, ack.session_present)
+                    .await;
+                subscription_progress(cfg, active, &fatal, &stop);
             }
             Ok(MqEvent::Incoming(Packet::SubAck(suback))) => {
-                for code in &suback.return_codes {
-                    match code {
-                        SubscribeReasonCode::Success(QoS::AtLeastOnce) => {
-                            log(format!("mqtt: subscribed to {:?} with QoS 1", cfg.topic));
-                            if let Some(r) = &cfg.ready {
-                                r.notify_one();
-                            }
-                        }
-                        other => set_fatal(
-                            &fatal,
-                            CollectError::Fatal(format!(
-                                "broker granted {other:?} for {:?}; QoS 1 is required for at-least-once capture",
-                                cfg.topic
-                            )),
-                            &stop,
-                        ),
-                    }
-                }
+                let active = subscriptions.on_suback(cfg, &suback.return_codes).await;
+                subscription_progress(cfg, active, &fatal, &stop);
+            }
+            Ok(MqEvent::Incoming(Packet::UnsubAck(_))) => {
+                let done = subscriptions.on_unsuback().await.map(|()| false);
+                subscription_progress(cfg, done, &fatal, &stop);
             }
             Ok(MqEvent::Incoming(Packet::Publish(publish))) => {
                 counters.received.fetch_add(1, Ordering::Relaxed);
@@ -666,6 +995,11 @@ async fn committer(
         }
         faults.hit(point::MQTT_BEFORE_COMMIT);
         let (ev, claim) = to_event(&cfg, &item);
+        if let EventData::MqttMessage(m) = &ev.data
+            && m.subscriptions.is_empty()
+        {
+            counters.unmatched.fetch_add(1, Ordering::Relaxed);
+        }
         let outcome = spool.append(ev, claim).await;
         match outcome {
             Ok(o) => {
@@ -772,5 +1106,106 @@ mod tests {
         c.max_payload_bytes = 1024;
         c.client_id.clear();
         assert!(c.validate(1 << 20).is_err());
+        c.client_id = "id".into();
+        c.topics = vec!["plant/line1/#".into(), "sensors/hub-1".into()];
+        assert!(c.validate(1 << 20).is_ok());
+        c.topics.push("plant/line1/#".into());
+        let e = c.validate(1 << 20).unwrap_err().to_string();
+        assert!(e.contains("duplicate"), "{e}");
+        c.topics = vec![];
+        assert!(c.validate(1 << 20).is_err());
+        c.topics = vec!["a/#/b".into()];
+        assert!(c.validate(1 << 20).is_err());
+    }
+
+    #[test]
+    fn filter_validation() {
+        for ok in [
+            "#", "+", "a", "a/b", "a/+/c", "+/+", "a/#", "/", "/a", "$SYS/#",
+        ] {
+            assert!(validate_filter(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "a#", "a/#/b", "#/a", "a/b#", "a+", "a/+b", "a\0b"] {
+            assert!(validate_filter(bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_filter(&"a".repeat(65_536)).is_err());
+    }
+
+    #[test]
+    fn wildcard_matching() {
+        let yes = [
+            ("plant/line1/spindle", "plant/line1/spindle"),
+            ("plant/+/spindle", "plant/line1/spindle"),
+            ("plant/#", "plant/line1/spindle"),
+            ("plant/#", "plant"),
+            ("#", "plant/line1"),
+            ("+/+", "/finance"),
+            ("+", ""),
+            ("sport/+", "sport/"),
+            ("$SYS/#", "$SYS/broker/load"),
+            ("$SYS/+", "$SYS/x"),
+        ];
+        for (f, t) in yes {
+            assert!(filter_matches(f, t), "{f} should match {t}");
+        }
+        let no = [
+            ("plant/line1/spindle", "plant/line1"),
+            ("plant/+", "plant/line1/spindle"),
+            ("plant/+", "plant"),
+            ("plant/#", "plants"),
+            ("plant/line1", "Plant/line1"),
+            ("sensors/hub-1", "plant/line1"),
+            ("#", "$SYS/broker"),
+            ("+/broker", "$SYS/broker"),
+            ("/+", "a/b"),
+        ];
+        for (f, t) in no {
+            assert!(!filter_matches(f, t), "{f} should not match {t}");
+        }
+    }
+
+    fn set(v: &[&str]) -> BTreeSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn topics(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn subscription_plan() {
+        let t = topics(&["b/#", "a/1"]);
+        let full = SubscriptionRecord {
+            confirmed: set(&["a/1", "b/#"]),
+            possible: set(&["a/1", "b/#"]),
+        };
+        // No broker session: subscribe to all, regardless of the record.
+        for known in [None, Some(&full)] {
+            let p = plan_subscriptions(&t, false, known);
+            assert_eq!(p.subscribe, t);
+            assert!(p.unsubscribe.is_empty());
+            assert_eq!(p.before.confirmed, set(&[]));
+            assert_eq!(p.after, full);
+        }
+        // Session present, record matches: nothing to do.
+        let p = plan_subscriptions(&t, true, Some(&full));
+        assert!(p.subscribe.is_empty() && p.unsubscribe.is_empty());
+        assert_eq!(p.after, full);
+        // Session present, unknown record: subscribe to all, remove nothing.
+        let p = plan_subscriptions(&t, true, None);
+        assert_eq!(p.subscribe, t);
+        assert!(p.unsubscribe.is_empty());
+        // Changed set: add c/+, drop a/1.
+        let t2 = topics(&["b/#", "c/+"]);
+        let p = plan_subscriptions(&t2, true, Some(&full));
+        assert_eq!(p.subscribe, topics(&["c/+"]));
+        assert_eq!(p.unsubscribe, topics(&["a/1"]));
+        assert_eq!(p.before.confirmed, set(&["b/#"]));
+        assert_eq!(p.before.possible, set(&["a/1", "b/#", "c/+"]));
+        // Interrupted change (only `before` was stored): re-applied, and a
+        // removed filter is never assumed to be held.
+        let p = plan_subscriptions(&t, true, Some(&p.before));
+        assert_eq!(p.subscribe, topics(&["a/1"]));
+        assert_eq!(p.unsubscribe, topics(&["c/+"]));
     }
 }
