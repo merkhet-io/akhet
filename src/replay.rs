@@ -17,9 +17,11 @@
 
 use crate::event;
 use crate::faults::{Faults, point};
+use crate::metrics::Metrics;
 use crate::spool::{SinkRow, Spool, SpoolError};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -39,6 +41,8 @@ pub struct ReplayConfig {
     pub follow: Option<Duration>,
     /// Stop after delivering this many records.
     pub limit: Option<u64>,
+    /// Report progress to a metrics endpoint.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 impl ReplayConfig {
@@ -53,6 +57,7 @@ impl ReplayConfig {
             backoff_max: Duration::from_secs(30),
             follow: None,
             limit: None,
+            metrics: None,
         }
     }
 }
@@ -192,13 +197,28 @@ fn with_retries<T>(
     let mut attempts = 0;
     loop {
         attempts += 1;
-        match f() {
+        let r = f();
+        if let Some(m) = &cfg.metrics {
+            m.replay
+                .last_attempt_failed
+                .store(r.is_err(), Ordering::Relaxed);
+            if r.is_err() {
+                m.error("replay", "transient");
+            }
+        }
+        match r {
             Ok(v) => return Ok(Some(v)),
             Err(e) if attempts >= cfg.max_attempts => {
+                if let Some(m) = &cfg.metrics {
+                    m.error("replay", "unavailable");
+                }
                 return Err(ReplayError::Unavailable { attempts, last: e });
             }
             Err(e) => {
                 *retries += 1;
+                if let Some(m) = &cfg.metrics {
+                    m.replay.retries.fetch_add(1, Ordering::Relaxed);
+                }
                 eprintln!(
                     "akhet: replay: transient failure ({e}); retry {attempts}/{} in {} ms",
                     cfg.max_attempts - 1,
@@ -269,11 +289,23 @@ pub fn run(
             return Ok(summary);
         }
         Some(Ok(id)) => id,
-        Some(Err(e)) => return Err(ReplayError::Protocol(e)),
+        Some(Err(e)) => {
+            if let Some(m) = &cfg.metrics {
+                m.replay.last_attempt_failed.store(true, Ordering::Relaxed);
+                m.error("replay", "protocol");
+            }
+            return Err(ReplayError::Protocol(e));
+        }
     };
     let sink: SinkRow = spool.bind_sink(&cfg.sink, &url, &receiver_id)?;
     summary.receiver_id = receiver_id;
     summary.checkpoint_seq = sink.checkpoint_seq;
+    if let Some(m) = &cfg.metrics {
+        m.replay
+            .checkpoint_seq
+            .store(sink.checkpoint_seq, Ordering::Relaxed);
+        m.replay.bound.store(true, Ordering::Relaxed);
+    }
     let events_url = format!("{url}/v1/events");
 
     'outer: loop {
@@ -327,8 +359,19 @@ pub fn run(
                     if duplicate {
                         summary.receiver_duplicates += 1;
                     }
+                    if let Some(m) = &cfg.metrics {
+                        m.replay.checkpoint_seq.store(rec.seq, Ordering::Relaxed);
+                        m.replay.delivered.fetch_add(1, Ordering::Relaxed);
+                        if duplicate {
+                            m.replay.receiver_duplicates.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
                 Some(Attempt::Permanent { status, body }) => {
+                    if let Some(m) = &cfg.metrics {
+                        m.replay.last_attempt_failed.store(true, Ordering::Relaxed);
+                        m.error("replay", "rejected");
+                    }
                     return Err(ReplayError::Rejected {
                         seq: rec.seq,
                         event_id: rec.event_id,

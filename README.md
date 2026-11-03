@@ -84,6 +84,7 @@ Crate layout (`src/`):
 | `replay.rs` | HTTP replay with checkpoint binding, sink lock, bounded retries |
 | `receiver.rs` | Example HTTP receiver (`akhet receive`) |
 | `faults.rs` | Fault injection for crash tests (`AKHET_FAULT`) |
+| `metrics.rs` | Optional Prometheus metrics, liveness and readiness endpoint |
 | `main.rs` | CLI |
 
 Concurrency is modest: a single-threaded Tokio runtime; SQLite work runs on
@@ -252,6 +253,110 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
   example receiver. Keep spool files in an access-controlled local directory and
   bind the receiver to loopback or a trusted network.
 
+## Observability
+
+`mqtt`, `modbus` and `replay` accept `--metrics-listen ADDR` (off by default)
+to serve three endpoints over plain HTTP:
+
+| Path | Meaning |
+|---|---|
+| `GET /metrics` | Prometheus text exposition format (0.0.4) |
+| `GET /healthz` | Liveness: `200 ok` while the process and the endpoint thread run. It does not show that collection is making progress; use the counters for that. |
+| `GET /readyz` | Readiness: `200 ready`, or `503` with the failing conditions in the body |
+
+```sh
+akhet --spool data/spool.sqlite mqtt --host 127.0.0.1 --port 1883 \
+  --client-id akhet-example-01 --topic 'sensors/#' --metrics-listen 127.0.0.1:9464
+curl -s 127.0.0.1:9464/metrics
+```
+
+The endpoint has no authentication and no TLS. Bind it to loopback
+(`127.0.0.1:PORT`) or a trusted network. A bind failure exits with code 2.
+
+Readiness, per command:
+
+- `mqtt`: connected (CONNACK received, no connection error since), the
+  subscription confirmed on the current connection (SUBACK granting QoS 1, or
+  CONNACK with an existing session), and the spool not full. Not ready while
+  shutting down.
+- `modbus`: the most recent poll succeeded and the spool is not full. Not
+  ready before the first poll completes. Failed polls are still recorded.
+- `replay`: the receiver identity was fetched and the sink binding verified,
+  and the most recent HTTP attempt (identity or event) did not fail. A retry
+  in progress makes replay not ready until an attempt succeeds.
+- "Spool full" means an append failed with the database-size limit or a full
+  filesystem, or the last spool sample shows fewer than 64 free pages under
+  `--max-db-bytes` (the margin the spool uses to classify `SQLITE_FULL`).
+
+How values are collected: collectors and replay update atomic counters
+(a relaxed add per event, no locks); the endpoint runs on its own thread and
+only reads them, so a slow scraper cannot block collection or `fsync`. Spool
+size and pending records need SQLite queries, and in `journal_mode=DELETE` any
+reader holds a shared lock that makes a concurrent commit wait. A separate
+sampler thread therefore reads them through its own read-only connection every
+`--metrics-spool-interval-ms` (default 5000), not per scrape, and scrapes serve
+the last sample. Each sample is two `PRAGMA`s, one index lookup and one range
+count per sink, which is proportional to that sink's pending records.
+`akhet_spool_sample_timestamp_seconds` shows its age; a failed sample is
+counted as `akhet_errors_total{component="metrics",kind="spool_sample"}` and
+the previous sample is kept.
+
+Metrics reference (all prefixed `akhet_`; counters reset when the process
+starts, like the exit-time JSON summaries, which are unchanged):
+
+| Metric | Type | Commands | Meaning |
+|---|---|---|---|
+| `akhet_info{mode,version}` | gauge | all | Always 1; labels identify the command and build |
+| `akhet_ready` | gauge | all | 1 when `/readyz` reports ready |
+| `akhet_errors_total{component,kind}` | counter | all | Errors by kind, see below |
+| `akhet_spool_max_db_bytes` | gauge | all | `--max-db-bytes` |
+| `akhet_spool_db_bytes_used` | gauge | all | SQLite pages in use × page size (sampled) |
+| `akhet_spool_headroom_bytes` | gauge | all | Bytes left under `--max-db-bytes` (sampled). Not free disk space |
+| `akhet_spool_last_seq` | gauge | all | Highest committed sequence number (sampled) |
+| `akhet_spool_pending_records{sink}` | gauge | all | Records above each sink's checkpoint (sampled) |
+| `akhet_spool_sample_timestamp_seconds` | gauge | all | Unix time of the last successful spool sample |
+| `akhet_spool_commit_duration_seconds` | histogram | mqtt, modbus | Duration of each collector append (one fsync'd transaction, including spool lock wait); buckets 0.5 ms to 10 s |
+| `akhet_mqtt_messages_received_total` | counter | mqtt | PUBLISH packets received |
+| `akhet_mqtt_messages_committed_total` | counter | mqtt | Messages committed as new records |
+| `akhet_mqtt_source_duplicates_total` | counter | mqtt | Redeliveries recognized by source identity, acknowledged without a new record |
+| `akhet_mqtt_acks_enqueued_total` | counter | mqtt | PUBACKs enqueued after commit |
+| `akhet_mqtt_acks_skipped_after_reconnect_total` | counter | mqtt | PUBACKs withheld because the message arrived on an earlier connection |
+| `akhet_mqtt_queue_saturation_events_total` | counter | mqtt | Times the socket-to-spool queue was full and socket reads paused |
+| `akhet_mqtt_dropped_unacknowledged_total` | counter | mqtt | Received messages dropped uncommitted and unacknowledged at shutdown |
+| `akhet_mqtt_qos0_messages_total` | counter | mqtt | Messages delivered at QoS 0 |
+| `akhet_mqtt_connections_total` | counter | mqtt | Successful connections (CONNACK) |
+| `akhet_mqtt_connection_errors_total` | counter | mqtt | Connection errors |
+| `akhet_mqtt_queue_depth` | gauge | mqtt | Messages queued between socket and spool |
+| `akhet_mqtt_queue_capacity` | gauge | mqtt | `--queue-capacity` |
+| `akhet_mqtt_connected` | gauge | mqtt | 1 while connected |
+| `akhet_mqtt_subscribed` | gauge | mqtt | 1 while the QoS 1 subscription is confirmed |
+| `akhet_modbus_polls_total{status}` | counter | modbus | Completed polls, `status` `ok` or `read_failed` |
+| `akhet_modbus_connections_total` | counter | modbus | TCP connections established |
+| `akhet_modbus_last_poll_ok` | gauge | modbus | 1 if the most recent poll succeeded |
+| `akhet_replay_delivered_total` | counter | replay | Records acknowledged (201/200) and checkpointed |
+| `akhet_replay_receiver_duplicates_total` | counter | replay | Deliveries the receiver reported as already stored (200) |
+| `akhet_replay_retries_total` | counter | replay | Retries after transient failures |
+| `akhet_replay_checkpoint_seq` | gauge | replay | Sink checkpoint sequence number |
+| `akhet_replay_lag_records` | gauge | replay | Records above this sink's checkpoint (sampled; absent until the sink exists) |
+| `akhet_replay_receiver_bound` | gauge | replay | 1 once the receiver identity is bound |
+| `akhet_replay_last_attempt_failed` | gauge | replay | 1 if the most recent HTTP attempt failed |
+
+Error kinds (`akhet_errors_total`): `component="mqtt"` with `kind` `io`, `tls`,
+`timeout`, `refused`, `protocol`, `other` (connection errors);
+`component="modbus"` with the `error_kind` of `read_failed` events
+(`connect`, `timeout`, `transport`, `exception`, `response_length`,
+`resolve`); `component="spool"` with `capacity`, `disk_full`, `conflict`,
+`corrupt`, `event_too_large`, `format`, `other` (failed collector appends);
+`component="replay"` with `transient` (each failed attempt), `unavailable`
+(retries exhausted), `rejected` (permanent HTTP failure), `protocol`;
+`component="metrics"` with `spool_sample`. A series appears once its first
+error occurs.
+
+Not exported: samples (decoded values) collected. Events store raw payloads
+and registers; counting samples needs payload decoding (issue #2). Sampled
+gauges can be up to one sampling interval old. Replay lag is in records, not
+time.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -286,7 +391,9 @@ unsupported schema and event format; capacity exhaustion; MQTT disconnects,
 redelivery and queue saturation; acknowledgments not carried across reconnects;
 graceful shutdown leaving uncommitted messages unacknowledged; Modbus timeout,
 exception and reconnect with explicit failed observations; concurrent-replayer
-exclusion and sink binding; TLS with a trusted and an untrusted CA.
+exclusion and sink binding; TLS with a trusted and an untrusted CA; metrics
+and readiness scraped from running collectors and replay (counters move,
+readiness flips as broker, device and receiver appear or disappear).
 
 Against an external broker (CI runs this with Mosquitto 2):
 

@@ -4,6 +4,7 @@
 pub mod adapters;
 pub mod event;
 pub mod faults;
+pub mod metrics;
 pub mod receiver;
 pub mod replay;
 pub mod spool;

@@ -2,6 +2,7 @@ use akhet::adapters::modbus::{self, ModbusConfig};
 use akhet::adapters::mqtt::{self, MqttConfig, SourceIdentityConfig, TlsSettings};
 use akhet::adapters::{AsyncSpool, CollectError, Stop};
 use akhet::faults::Faults;
+use akhet::metrics::{Metrics, MetricsServer, Mode};
 use akhet::receiver::Receiver;
 use akhet::replay::{self, ReplayConfig, ReplayError};
 use akhet::spool::{self, Spool, SpoolError};
@@ -47,6 +48,19 @@ struct Cli {
     command: Command,
 }
 
+/// Optional observability endpoint (mqtt, modbus, replay).
+#[derive(clap::Args)]
+struct MetricsArgs {
+    /// Serve /metrics (Prometheus), /healthz and /readyz on this address,
+    /// e.g. 127.0.0.1:9464. Off by default; no authentication or TLS, so bind
+    /// to loopback or a trusted network.
+    #[arg(long)]
+    metrics_listen: Option<String>,
+    /// How often the metrics endpoint samples spool size and pending records.
+    #[arg(long, default_value_t = 5000, requires = "metrics_listen")]
+    metrics_spool_interval_ms: u64,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Collect MQTT messages (QoS 1, acknowledged after durable commit).
@@ -86,6 +100,8 @@ enum Command {
         /// Stop after this many messages.
         #[arg(long)]
         limit: Option<u64>,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
     /// Poll Modbus TCP holding registers (function 0x03, read-only).
     Modbus {
@@ -108,6 +124,8 @@ enum Command {
         /// Stop after this many polls.
         #[arg(long)]
         limit: Option<u64>,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
     /// Replay committed records to an HTTP receiver.
     Replay {
@@ -130,6 +148,8 @@ enum Command {
         follow_interval_ms: u64,
         #[arg(long)]
         limit: Option<u64>,
+        #[command(flatten)]
+        metrics: MetricsArgs,
     },
     /// Show spool size, limits, record counts and sink checkpoints.
     Status,
@@ -197,6 +217,35 @@ async fn watch_signals(stop: Stop, flag: Arc<AtomicBool>) {
     stop.trigger();
 }
 
+/// Start the metrics endpoint if `--metrics-listen` was given.
+fn start_metrics(
+    args: &MetricsArgs,
+    mode: Mode,
+    cli_spool: &std::path::Path,
+    max_db_bytes: u64,
+    sink: Option<&str>,
+) -> Result<(Option<Arc<Metrics>>, Option<MetricsServer>), ExitCode> {
+    let Some(listen) = &args.metrics_listen else {
+        return Ok((None, None));
+    };
+    let metrics = Metrics::new(mode, max_db_bytes, sink);
+    let server = MetricsServer::start(
+        listen,
+        metrics.clone(),
+        cli_spool.to_path_buf(),
+        Duration::from_millis(args.metrics_spool_interval_ms.max(100)),
+    )
+    .map_err(|e| fail(2, format!("metrics endpoint: {e}")))?;
+    eprintln!(
+        "akhet: metrics on http://{} (/metrics, /healthz, /readyz; no auth/TLS)",
+        server
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| listen.clone())
+    );
+    Ok((Some(metrics), Some(server)))
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let faults = match Faults::from_env() {
@@ -233,11 +282,17 @@ fn main() -> ExitCode {
             source_id_namespace,
             source_id_json_pointer,
             limit,
+            metrics,
         } => {
             let spool = match open() {
                 Ok(s) => s,
                 Err(e) => return fail(spool_exit(&e), e),
             };
+            let (metrics, _server) =
+                match start_metrics(&metrics, Mode::Mqtt, &cli.spool, cli.max_db_bytes, None) {
+                    Ok(m) => m,
+                    Err(code) => return code,
+                };
             let mut cfg = MqttConfig::new(&host, port, &client_id, &topic);
             cfg.username = std::env::var("AKHET_MQTT_USERNAME")
                 .ok()
@@ -260,7 +315,10 @@ fn main() -> ExitCode {
                         json_pointer,
                     });
             cfg.limit = limit;
-            let spool = AsyncSpool::new(spool, faults);
+            let mut spool = AsyncSpool::new(spool, faults);
+            if let Some(m) = metrics {
+                spool = spool.with_metrics(m);
+            }
             match rt.block_on(mqtt::run(cfg, spool, cli.max_event_bytes, stop)) {
                 Ok(summary) => {
                     print_json(&summary);
@@ -278,11 +336,17 @@ fn main() -> ExitCode {
             interval_ms,
             timeout_ms,
             limit,
+            metrics,
         } => {
             let spool = match open() {
                 Ok(s) => s,
                 Err(e) => return fail(spool_exit(&e), e),
             };
+            let (metrics, _server) =
+                match start_metrics(&metrics, Mode::Modbus, &cli.spool, cli.max_db_bytes, None) {
+                    Ok(m) => m,
+                    Err(code) => return code,
+                };
             let cfg = ModbusConfig {
                 host,
                 port,
@@ -293,7 +357,10 @@ fn main() -> ExitCode {
                 timeout: Duration::from_millis(timeout_ms),
                 limit,
             };
-            let spool = AsyncSpool::new(spool, faults);
+            let mut spool = AsyncSpool::new(spool, faults);
+            if let Some(m) = metrics {
+                spool = spool.with_metrics(m);
+            }
             match rt.block_on(modbus::run(cfg, spool, stop)) {
                 Ok(summary) => {
                     print_json(&summary);
@@ -311,13 +378,25 @@ fn main() -> ExitCode {
             follow,
             follow_interval_ms,
             limit,
+            metrics,
         } => {
+            let (metrics, _server) = match start_metrics(
+                &metrics,
+                Mode::Replay,
+                &cli.spool,
+                cli.max_db_bytes,
+                Some(&sink),
+            ) {
+                Ok(m) => m,
+                Err(code) => return code,
+            };
             let mut cfg = ReplayConfig::new(&url, &sink);
             cfg.request_timeout = Duration::from_millis(timeout_ms);
             cfg.max_attempts = max_attempts;
             cfg.backoff_max = Duration::from_millis(max_backoff_ms);
             cfg.follow = follow.then(|| Duration::from_millis(follow_interval_ms));
             cfg.limit = limit;
+            cfg.metrics = metrics;
             let path = cli.spool.clone();
             let max = cli.max_db_bytes;
             let f2 = flag.clone();

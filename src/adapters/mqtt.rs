@@ -170,19 +170,8 @@ pub struct MqttSummary {
     pub qos0_messages: u64,
 }
 
-#[derive(Default)]
-struct Counters {
-    received: AtomicU64,
-    committed: AtomicU64,
-    source_duplicates: AtomicU64,
-    acks_enqueued: AtomicU64,
-    acks_skipped: AtomicU64,
-    saturation: AtomicU64,
-    dropped: AtomicU64,
-    connections: AtomicU64,
-    connection_errors: AtomicU64,
-    qos0: AtomicU64,
-}
+// Shared with the metrics endpoint when one is configured.
+use crate::metrics::MqttCounters as Counters;
 
 impl Counters {
     fn summary(&self) -> MqttSummary {
@@ -347,6 +336,18 @@ fn to_event(cfg: &MqttConfig, r: &Received) -> (Event, Option<SourceClaim>) {
     (ev, claim)
 }
 
+/// Stable error-kind label for a connection error.
+fn connection_error_kind(e: &ConnectionError) -> &'static str {
+    match e {
+        ConnectionError::Io(_) => "io",
+        ConnectionError::Tls(_) => "tls",
+        ConnectionError::NetworkTimeout | ConnectionError::FlushTimeout => "timeout",
+        ConnectionError::ConnectionRefused(_) => "refused",
+        ConnectionError::MqttState(_) | ConnectionError::NotConnAck(_) => "protocol",
+        _ => "other",
+    }
+}
+
 fn fatal_connection_error(e: &ConnectionError) -> Option<String> {
     match e {
         ConnectionError::ConnectionRefused(code) => Some(match code {
@@ -380,7 +381,11 @@ pub async fn run(
     // Request channel: subscribe, PUBACKs, disconnect. PUBACKs are enqueued
     // with try_ack and retried, so a full channel never blocks the committer.
     let (client, eventloop) = AsyncClient::new(opts, cfg.queue_capacity.max(16) * 2);
-    let counters = Arc::new(Counters::default());
+    let metrics = spool.metrics().cloned();
+    let counters = metrics.as_ref().map(|m| m.mqtt.clone()).unwrap_or_default();
+    counters
+        .queue_capacity
+        .store(cfg.queue_capacity as u64, Ordering::Relaxed);
     let generation = Arc::new(Mutex::new(0u64));
     let fatal: Arc<Mutex<Option<CollectError>>> = Arc::new(Mutex::new(None));
     let stopping = Arc::new(AtomicBool::new(false));
@@ -416,6 +421,7 @@ pub async fn run(
         stopping,
         committer,
         acker,
+        metrics,
     )
     .await;
 
@@ -449,6 +455,7 @@ async fn poll_loop(
     stopping: Arc<AtomicBool>,
     committer: tokio::task::JoinHandle<()>,
     acker: tokio::task::JoinHandle<()>,
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 ) {
     let mut queue_tx = Some(queue_tx);
     let mut backoff = cfg.reconnect_min;
@@ -460,6 +467,8 @@ async fn poll_loop(
         // Transition into the shutdown phase exactly once.
         if drain_deadline.is_none() && stop.is_triggered() {
             stopping.store(true, Ordering::SeqCst);
+            // Not ready while draining.
+            counters.subscribed.store(false, Ordering::Relaxed);
             drain_deadline = Some(tokio::time::Instant::now() + cfg.shutdown_grace);
             // Closing the queue lets the committer finish its current
             // transaction and then drop (without acking) anything queued.
@@ -506,6 +515,10 @@ async fn poll_loop(
         match polled {
             Ok(MqEvent::Incoming(Packet::ConnAck(ack))) => {
                 counters.connections.fetch_add(1, Ordering::Relaxed);
+                counters.connected.store(true, Ordering::Relaxed);
+                counters
+                    .subscribed
+                    .store(ack.session_present, Ordering::Relaxed);
                 backoff = cfg.reconnect_min;
                 log(format!(
                     "mqtt: connected to {}:{} as {:?} (session_present={})",
@@ -533,6 +546,7 @@ async fn poll_loop(
                     match code {
                         SubscribeReasonCode::Success(QoS::AtLeastOnce) => {
                             log(format!("mqtt: subscribed to {:?} with QoS 1", cfg.topic));
+                            counters.subscribed.store(true, Ordering::Relaxed);
                             if let Some(r) = &cfg.ready {
                                 r.notify_one();
                             }
@@ -574,6 +588,9 @@ async fn poll_loop(
                     generation: gen_now,
                     received_unix_ns: event::now_unix_ns(),
                 };
+                // Counted before sending so the committer's decrement can
+                // never precede it.
+                counters.queue_depth.fetch_add(1, Ordering::Relaxed);
                 match tx.try_send(item) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(item)) => {
@@ -587,14 +604,17 @@ async fn poll_loop(
                         tokio::select! {
                             r = tx.send(item) => if r.is_err() {
                                 counters.dropped.fetch_add(1, Ordering::Relaxed);
+                                counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
                             },
                             _ = stop.wait() => {
                                 counters.dropped.fetch_add(1, Ordering::Relaxed);
+                                counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
                             }
                         }
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         counters.dropped.fetch_add(1, Ordering::Relaxed);
+                        counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -608,6 +628,11 @@ async fn poll_loop(
             Ok(_) => {}
             Err(e) => {
                 counters.connection_errors.fetch_add(1, Ordering::Relaxed);
+                counters.connected.store(false, Ordering::Relaxed);
+                counters.subscribed.store(false, Ordering::Relaxed);
+                if let Some(m) = &metrics {
+                    m.error("mqtt", connection_error_kind(&e));
+                }
                 {
                     // Invalidate acknowledgments for the lost connection and
                     // purge any PUBACK enqueued in the race window.
@@ -661,6 +686,7 @@ async fn committer(
             _ = stop.wait() => break,
             m = rx.recv() => match m { Some(m) => m, None => break },
         };
+        counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
         if item.publish.qos == QoS::AtMostOnce {
             counters.qos0.fetch_add(1, Ordering::Relaxed);
         }
@@ -704,6 +730,7 @@ async fn committer(
     rx.close();
     while let Ok(_unacked) = rx.try_recv() {
         counters.dropped.fetch_add(1, Ordering::Relaxed);
+        counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
     }
     let dropped = counters.dropped.load(Ordering::Relaxed);
     if dropped > 0 {

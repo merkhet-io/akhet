@@ -176,6 +176,7 @@ pub async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let endpoint = format!("{}:{}", cfg.host, cfg.port);
     let mut consecutive_failures = 0u64;
+    let metrics = spool.metrics().cloned();
     loop {
         if cfg.limit.is_some_and(|l| summary.polls >= l) {
             break;
@@ -190,6 +191,23 @@ pub async fn run(
         let (result, new_connection) = poll_once(&cfg, &mut ctx, &mut summary.connections).await;
         let duration_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let completed_unix_ns = event::now_unix_ns();
+        if let Some(m) = &metrics {
+            use std::sync::atomic::Ordering::Relaxed;
+            if new_connection {
+                m.modbus.connections.fetch_add(1, Relaxed);
+            }
+            match &result {
+                Ok(_) => {
+                    m.modbus.polls_ok.fetch_add(1, Relaxed);
+                    m.modbus.last_poll.store(1, Relaxed);
+                }
+                Err(f) => {
+                    m.modbus.polls_failed.fetch_add(1, Relaxed);
+                    m.modbus.last_poll.store(2, Relaxed);
+                    m.error("modbus", f.kind);
+                }
+            }
+        }
         let outcome = match result {
             Ok(registers) => {
                 summary.ok += 1;

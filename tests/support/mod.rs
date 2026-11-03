@@ -77,8 +77,12 @@ pub struct TestReceiver {
 
 impl TestReceiver {
     pub fn start(db: &Path) -> TestReceiver {
+        Self::start_at(db, "127.0.0.1:0")
+    }
+
+    pub fn start_at(db: &Path, listen: &str) -> TestReceiver {
         let spool = Spool::open(db, MAX_DB).unwrap();
-        let r = Receiver::bind("127.0.0.1:0", spool, Faults::none()).unwrap();
+        let r = Receiver::bind(listen, spool, Faults::none()).unwrap();
         let url = format!("http://{}", r.local_addr().unwrap());
         let receiver_id = r.receiver_id().to_string();
         let stop = Arc::new(AtomicBool::new(false));
