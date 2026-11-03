@@ -35,6 +35,8 @@ pub fn akhet(spool: &Path, args: &[&str], fault: Option<&str>) -> Command {
     c.arg("--spool").arg(spool).args(args);
     c.env_remove("AKHET_FAULT");
     c.env_remove("AKHET_SPOOL");
+    c.env_remove("AKHET_REPLAY_TOKEN");
+    c.env_remove("AKHET_RECEIVER_TOKEN");
     if let Some(f) = fault {
         c.env("AKHET_FAULT", f);
     }
@@ -77,9 +79,18 @@ pub struct TestReceiver {
 
 impl TestReceiver {
     pub fn start(db: &Path) -> TestReceiver {
+        Self::start_with(db, "http", |r| r)
+    }
+
+    /// Receiver configured by `f` (TLS, token), addressed as `scheme://127.0.0.1:port`.
+    pub fn start_with(
+        db: &Path,
+        scheme: &str,
+        f: impl FnOnce(Receiver) -> Receiver,
+    ) -> TestReceiver {
         let spool = Spool::open(db, MAX_DB).unwrap();
-        let r = Receiver::bind("127.0.0.1:0", spool, Faults::none()).unwrap();
-        let url = format!("http://{}", r.local_addr().unwrap());
+        let r = f(Receiver::bind("127.0.0.1:0", spool, Faults::none()).unwrap());
+        let url = format!("{scheme}://{}", r.local_addr().unwrap());
         let receiver_id = r.receiver_id().to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let s2 = stop.clone();
