@@ -55,9 +55,10 @@ enum Command {
         host: String,
         #[arg(long, default_value_t = 1883)]
         port: u16,
-        /// Topic filter to subscribe to with QoS 1.
-        #[arg(long)]
-        topic: String,
+        /// Topic filter to subscribe to with QoS 1. Repeat for several filters
+        /// (one SUBSCRIBE, one persistent session).
+        #[arg(long, required = true)]
+        topic: Vec<String>,
         /// Stable, unique client id (identifies the persistent broker session).
         #[arg(long)]
         client_id: String,
@@ -238,7 +239,7 @@ fn main() -> ExitCode {
                 Ok(s) => s,
                 Err(e) => return fail(spool_exit(&e), e),
             };
-            let mut cfg = MqttConfig::new(&host, port, &client_id, &topic);
+            let mut cfg = MqttConfig::with_topics(&host, port, &client_id, topic);
             cfg.username = std::env::var("AKHET_MQTT_USERNAME")
                 .ok()
                 .filter(|s| !s.is_empty());

@@ -39,9 +39,10 @@ cargo run --example modbus_simulator -- 127.0.0.1:5020
 akhet --spool data/spool.sqlite modbus --host 127.0.0.1 --port 5020 \
   --device-id 1 --address 0 --count 4 --interval-ms 1000 --timeout-ms 1000 --limit 3
 
-# Terminal 3: collect MQTT (stop with Ctrl-C, or use --limit N)
+# Terminal 3: collect MQTT (stop with Ctrl-C, or use --limit N);
+#             repeat --topic for several filters
 akhet --spool data/spool.sqlite mqtt --host 127.0.0.1 --port 1883 \
-  --client-id akhet-example-01 --topic 'sensors/#'
+  --client-id akhet-example-01 --topic 'sensors/#' --topic 'plant/line1/+'
 
 # Terminal 4: publish three QoS 1 messages
 cargo run --example mqtt_publish -- 127.0.0.1:1883 sensors/demo 3
@@ -100,9 +101,15 @@ generated once at capture and unchanged by retries), `collected_unix_ns`
 unknown `format_version` values. The format is an example contract, not a
 stable public interchange format.
 
-MQTT (`kind: "mqtt_message"`): `broker`, `client_id`, `subscription`, `topic`,
-`qos`, `retain`, `dup`, `payload_base64` (raw bytes, standard base64),
-`payload_len`, optional `source_identity_error`.
+MQTT (`kind: "mqtt_message"`): `broker`, `client_id`, `subscription`,
+`subscriptions`, `topic`, `qos`, `retain`, `dup`, `payload_base64` (raw bytes,
+standard base64), `payload_len`, optional `source_identity_error`.
+`subscriptions` lists every configured `--topic` filter that matches `topic`
+(MQTT 3.1.1 wildcard rules for `+` and `#`), in configuration order;
+`subscription` is the first of them, or `""` when none matches (see below).
+`subscriptions` was added within `format_version` 1: records written before it
+lack the field, and in them `subscription` is the single configured filter.
+Readers that ignore unknown fields are unaffected.
 
 Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
 (`read_holding_registers`), `start_address` (zero-based), `count`,
@@ -139,8 +146,36 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
   overflows, messages are lost upstream and Akhet cannot detect it. The bundled
   example broker is in-memory. Observed: rumqttd redelivers with `dup=false`;
   treat `dup` as informational only.
-- The subscription is (re)issued only when the broker reports no session.
-  Changing `--topic` for an existing `--client-id` requires a new client id.
+- Several filters: `--topic` is repeatable. Filters are validated (non-empty,
+  MQTT 3.1.1 wildcard syntax, no duplicates) and subscribed with QoS 1 in one
+  SUBSCRIBE; every SUBACK return code is checked. Overlapping filters (e.g.
+  `plant/#` and `plant/line1/+`) are allowed; the broker may then deliver a
+  message once or once per matching filter, and each delivered copy is stored.
+  All filters share one persistent session, one queue and one spool.
+- Subscriptions of an existing session: re-subscribing would make the broker
+  re-send retained messages, so with `session_present=true` the collector only
+  applies the difference to the filter set it last confirmed for this broker
+  address and client id. That set is recorded in the spool's `meta` table
+  (not an event, never replayed), written before each change and after the
+  broker acknowledges it. Added filters are subscribed (retained messages for
+  them arrive once); removed filters are unsubscribed. With
+  `session_present=false` the broker holds no subscriptions and all filters
+  are subscribed. Consequences:
+  - Messages the broker queued for a removed filter before it processed the
+    UNSUBSCRIBE are still delivered; they are stored with `subscription: ""`,
+    `subscriptions: []` and counted in `unmatched_messages`.
+  - A removal is recorded once the broker sends UNSUBACK; until then the next
+    start sends the UNSUBSCRIBE again. Capture of the configured filters does
+    not wait for it. Observed: the bundled example broker (rumqttd 0.20) never
+    answers UNSUBSCRIBE on a resumed session and keeps delivering the removed
+    filter; Mosquitto 2 removes it.
+  - The record lives in the spool. If the spool has none for a session the
+    broker still holds (new or replaced spool file, or a collector built
+    before this change), all configured filters are subscribed (retained
+    messages arrive again) and filters subscribed earlier that are no longer
+    configured cannot be identified, so they are not removed. Do not share a
+    `--client-id` between spools or tools; to start from a clean slate, use a
+    new client id.
 - If the broker grants less than QoS 1, collection stops with an error.
   Publications sent with QoS 0 are delivered at QoS 0, recorded with `qos: 0`
   and counted (`qos0_messages`); they have no redelivery guarantee. QoS 2 is
@@ -284,7 +319,9 @@ during replay; receiver crash after commit; repeated replay without duplicate
 receiver records; conflicting event and source identity; corrupted payload;
 unsupported schema and event format; capacity exhaustion; MQTT disconnects,
 redelivery and queue saturation; acknowledgments not carried across reconnects;
-graceful shutdown leaving uncommitted messages unacknowledged; Modbus timeout,
+graceful shutdown leaving uncommitted messages unacknowledged; several topic
+filters with redelivery on two unrelated topics after a reconnect and after a
+crash, and adding/removing filters on an existing session; Modbus timeout,
 exception and reconnect with explicit failed observations; concurrent-replayer
 exclusion and sink binding; TLS with a trusted and an untrusted CA.
 
