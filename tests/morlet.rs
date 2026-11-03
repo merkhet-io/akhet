@@ -311,6 +311,37 @@ fn replays_bit_exact_with_gaps_duplicates_and_context() {
 
     assert_searchable(&coll);
 
+    // The value in effect (11 since the last change, still open and so not
+    // in the context timeline) is visible in akhet_morlet_context_current.
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let cur = db
+        .query(
+            "SELECT collection, source, key, value, since_unix_ns, spool_seq FROM akhet_morlet_context_current WHERE sink=$1",
+            &[&sink],
+        )
+        .unwrap();
+    assert_eq!(cur.len(), 1);
+    let last_change_ms = (T0_US + (6 * N as i64 + 100 + 780) * 25) / 1000;
+    let (c, src, key, v, since, seq): (String, String, String, serde_json::Value, i64, i64) = (
+        cur[0].get(0),
+        cur[0].get(1),
+        cur[0].get(2),
+        cur[0].get(3),
+        cur[0].get(4),
+        cur[0].get(5),
+    );
+    assert_eq!(
+        (c.as_str(), src.as_str(), key.as_str(), v, since),
+        (
+            coll.as_str(),
+            "hub-1",
+            "program",
+            11.into(),
+            last_change_ms * 1_000_000
+        )
+    );
+    assert_eq!(seq, s["checkpoint_seq"].as_i64().unwrap(), "last record");
+
     // Nothing left: a second run writes nothing and changes nothing.
     let out = morlet_run(&spool, &cfg, &sink, &coll, None);
     assert!(out.status.success());
