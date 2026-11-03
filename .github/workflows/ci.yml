@@ -59,16 +59,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Start MorletDB (disposable, loopback, test credentials only)
-        run: |
-          docker run -d --name morlet -p 127.0.0.1:54339:5432 \
-            -e POSTGRES_USER=morlet -e POSTGRES_PASSWORD=morlet-test -e POSTGRES_DB=morlet \
-            ghcr.io/merkhet-io/morletdb:0.3.3-alpha.1
-          for i in $(seq 1 60); do docker exec morlet pg_isready -U morlet -d morlet && break; sleep 1; done
-          sleep 2
-          docker exec morlet psql -U morlet -d morlet -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS pg_morlet'
+      - name: Start MorletDB (disposable, loopback, test credentials, throwaway TLS CA)
+        run: ci/morletdb-test.sh "$RUNNER_TEMP/pgcerts"
       - run: cargo test --locked --test morlet -- --ignored --test-threads=1
         env:
           AKHET_TEST_MORLET_URL: postgresql://morlet:morlet-test@127.0.0.1:54339/morlet
+          AKHET_TEST_MORLET_CERTS: ${{ runner.temp }}/pgcerts
       - if: always()
         run: docker logs morlet | tail -50

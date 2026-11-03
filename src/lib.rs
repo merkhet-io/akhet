@@ -8,6 +8,7 @@ pub mod event;
 pub mod faults;
 pub mod metrics;
 pub mod morlet;
+pub mod pgtls;
 pub mod receiver;
 pub mod replay;
 pub mod spool;

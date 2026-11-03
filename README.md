@@ -100,7 +100,8 @@ Crate layout (`src/`):
 | `adapters/mod.rs` | Blocking-pool spool handle, stop signal |
 | `replay.rs` | HTTP replay with checkpoint binding, sink lock, bounded retries, optional batch requests, TLS and token auth |
 | `receiver.rs` | Example HTTP receiver (`akhet receive`): minimal HTTP/1.1, optional TLS and auth, batch extension |
-| `tls.rs` | PEM loading and rustls configuration shared by MQTT, replay and receiver |
+| `tls.rs` | PEM loading and rustls configuration shared by MQTT, replay, receiver and the MorletDB connection |
+| `pgtls.rs` | MorletDB connection TLS: libpq `sslmode`/`sslrootcert`/`sslcert`/`sslkey`, secure default for remote hosts |
 | `faults.rs` | Fault injection for crash tests (`AKHET_FAULT`) |
 | `metrics.rs` | Optional Prometheus metrics, liveness and readiness endpoint |
 | `main.rs` | CLI |
@@ -253,7 +254,7 @@ chunks in a MorletDB stream collection; `context_signals` → interval rows in
 the collection's context timeline.
 
 ```sh
-export AKHET_MORLET_URL='postgresql://user:password@db.example:5432/morlet'   # never on argv
+export AKHET_MORLET_URL='postgresql://user:password@db.example:5432/morlet?sslrootcert=/etc/akhet/db-ca.pem'   # never on argv
 akhet --spool data/s.sqlite morlet --sink central --collection signals \
   --config decoder.json --create-collection --follow
 ```
@@ -292,12 +293,30 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
   (exit 6 when exhausted). Anything MorletDB rejects (conflicting samples at
   an existing offset, overlapping context, a rate or chunk it refuses) is
   permanent (exit 5), with the database message.
+- **TLS:** libpq parameters in `AKHET_MORLET_URL` (URL query or
+  `key=value`), handled by Akhet with rustls (the same rustls 0.23 and ring as
+  MQTT and replay):
+  - `sslmode`: `verify-full` (chain and host name), `verify-ca` (chain only),
+    `require` (encrypted, server not authenticated; a warning is printed) or
+    `disable`. `allow` and `prefer` are refused because they can fall back to
+    plain text.
+  - **Default:** without `sslmode`, a loopback host (`localhost`, 127.0.0.0/8,
+    `::1`) or a Unix socket connects without TLS, and **any other host uses
+    `verify-full`** (a notice is printed). Set `sslmode=disable` explicitly for
+    a remote server without TLS.
+  - `sslrootcert`: PEM file of trusted CAs; absent or `system` means the
+    platform trust store (libpq uses `~/.postgresql/root.crt` instead). As in
+    libpq, `require` with an explicit `sslrootcert` verifies the chain.
+  - `sslcert` and `sslkey`: client certificate (both or neither).
+  - An untrusted or misnamed server certificate, a refused client
+    certificate or a server without TLS is permanent: exit 8, not retried.
+    The summary reports the effective `sslmode`; the URL and password are
+    never printed.
 - **Privileges:** the role needs to create the `akhet_morlet_*` tables in its
   schema (once) and use the collection; `--create-collection` additionally
   creates the stream collection and its context tables.
 
-Limits: the connection has no TLS yet (use a local socket, a VPN or a
-TLS-terminating proxy). One sink transaction holds `--records-per-tx`
+Limits: one sink transaction holds `--records-per-tx`
 records; the stored state grows with the number of channels and
 `dedup_window_samples`, and is rewritten on every transaction. Two sinks must
 not write the same recordings. Feature extraction defaults to `none` (raw
@@ -810,13 +829,19 @@ redelivered), a kill after a batch commit before its acknowledgments (whole
 batch redelivered), and batched replay killed after the remote commit or after
 the checkpoint, plus a conflict in the middle of a batch.
 
-Against MorletDB (CI runs this with the published pg_morlet image; see the
-header of `tests/morlet.rs`):
+Against MorletDB (CI runs this with the published pg_morlet image).
+`ci/morletdb-test.sh` starts a disposable container (loopback, test
+credentials, TLS with a throwaway CA, container name `morlet`):
 
 ```sh
+ci/morletdb-test.sh /tmp/akhet-pgcerts
 AKHET_TEST_MORLET_URL=postgresql://morlet:morlet-test@127.0.0.1:54339/morlet \
+AKHET_TEST_MORLET_CERTS=/tmp/akhet-pgcerts \
   cargo test --locked --test morlet -- --ignored --test-threads=1
 ```
+
+The TLS test checks `verify-full` (succeeds with the CA; fails with a wrong
+host name, another CA or no CA), `verify-ca` and the plain loopback default.
 
 Not covered: power-failure durability, broker restarts with persistence, real
 Modbus devices, multi-day soak tests.

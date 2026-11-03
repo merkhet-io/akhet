@@ -25,6 +25,7 @@ tokio = { version = "1", features = ["rt", "macros", "time", "net", "signal", "s
 tokio-modbus = { version = "0.17", default-features = false, features = ["tcp"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 uuid = { version = "1", features = ["v4"] }
+tokio-postgres-rustls = { version = "0.14.0", default-features = false }
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }

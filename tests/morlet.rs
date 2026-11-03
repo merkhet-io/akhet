@@ -2,11 +2,13 @@
 //!
 //! Ignored by default. Run with a disposable database, e.g.:
 //! ```sh
-//! docker run -d --name morlet-test -e POSTGRES_USER=morlet -e POSTGRES_PASSWORD=morlet-test \
-//!   -e POSTGRES_DB=morlet -p 127.0.0.1:54339:5432 ghcr.io/merkhet-io/morletdb:0.3.3-alpha.1
+//! ci/morletdb-test.sh /tmp/akhet-pgcerts
+//! AKHET_TEST_MORLET_CERTS=/tmp/akhet-pgcerts \
 //! AKHET_TEST_MORLET_URL=postgresql://morlet:morlet-test@127.0.0.1:54339/morlet \
 //!   cargo test --locked --test morlet -- --ignored --test-threads=1
 //! ```
+//! `AKHET_TEST_MORLET_CERTS` (the CA files written by the script) is only
+//! needed by the TLS test.
 
 mod support;
 
@@ -143,6 +145,18 @@ fn morlet_run_args(
     fault: Option<&str>,
     extra: &[&str],
 ) -> std::process::Output {
+    morlet_run_url(&url(), spool, cfg, sink, coll, fault, extra)
+}
+
+fn morlet_run_url(
+    url: &str,
+    spool: &Path,
+    cfg: &Path,
+    sink: &str,
+    coll: &str,
+    fault: Option<&str>,
+    extra: &[&str],
+) -> std::process::Output {
     let mut args = vec![
         "morlet",
         "--sink",
@@ -159,7 +173,7 @@ fn morlet_run_args(
     ];
     args.extend_from_slice(extra);
     let mut c = akhet(spool, &args, fault);
-    c.env("AKHET_MORLET_URL", url());
+    c.env("AKHET_MORLET_URL", url);
     let out = c.output().unwrap();
     eprintln!(
         "morlet -> {:?}\n{}\n{}",
@@ -399,4 +413,75 @@ fn binding_and_conflicts_are_refused() {
     let out = morlet_run(&third, &cfg, &unique("s"), &coll, None);
     assert_eq!(out.status.code(), Some(5));
     assert!(String::from_utf8_lossy(&out.stderr).contains("conflicting replay"));
+}
+
+#[test]
+#[ignore = "needs AKHET_TEST_MORLET_URL and AKHET_TEST_MORLET_CERTS (ci/morletdb-test.sh)"]
+fn tls_modes_and_certificate_checks() {
+    let certs = std::path::PathBuf::from(
+        std::env::var("AKHET_TEST_MORLET_CERTS").expect("set AKHET_TEST_MORLET_CERTS"),
+    );
+    let ca = certs.join("ca.pem");
+    let other_ca = certs.join("other-ca.pem");
+    let base = url();
+    assert!(base.contains("@127.0.0.1:"), "test URL must use 127.0.0.1");
+    // The server certificate names only `localhost`.
+    let by_name = base.replace("@127.0.0.1:", "@localhost:");
+    let with = |u: &str, q: &str| format!("{u}?{q}");
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("s.sqlite");
+    let want = build_spool(&spool);
+    let cfg = decoder_file(dir.path());
+    let run_with = |u: &str| {
+        let coll = unique("akhet_tls");
+        let out = morlet_run_url(u, &spool, &cfg, &unique("s"), &coll, None, &[]);
+        (out, coll)
+    };
+
+    // verify-full with the right CA and host name: exact replay.
+    let (out, coll) = run_with(&with(
+        &by_name,
+        &format!("sslmode=verify-full&sslrootcert={}", ca.display()),
+    ));
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)["sslmode"], "verify-full");
+    assert_exact(&coll, &want);
+
+    // Wrong host name or untrusted CA: permanent TLS failure, not retried.
+    for (u, what) in [
+        (&base, ca.display().to_string()),
+        (&by_name, other_ca.display().to_string()),
+    ] {
+        let (out, _) = run_with(&with(u, &format!("sslmode=verify-full&sslrootcert={what}")));
+        assert_eq!(out.status.code(), Some(8), "{u} with {what}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("certificate"), "{err}");
+        assert!(!err.contains("retry"), "not retried: {err}");
+        assert!(!err.contains("morlet-test"), "no password in errors");
+    }
+    // Without the CA the platform trust store does not know the test CA.
+    let (out, _) = run_with(&with(&by_name, "sslmode=verify-full"));
+    assert_eq!(out.status.code(), Some(8));
+
+    // verify-ca checks the chain only: the IP address is accepted.
+    let (out, coll) = run_with(&with(
+        &base,
+        &format!("sslmode=verify-ca&sslrootcert={}", ca.display()),
+    ));
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)["sslmode"], "verify-ca");
+    assert_exact(&coll, &want);
+    // ...but not an untrusted chain.
+    let (out, _) = run_with(&with(
+        &base,
+        &format!("sslmode=verify-ca&sslrootcert={}", other_ca.display()),
+    ));
+    assert_eq!(out.status.code(), Some(8));
+
+    // Loopback without sslmode stays plain; prefer is refused.
+    let (out, _) = run_with(&base);
+    assert!(out.status.success());
+    assert_eq!(stdout_json(&out)["sslmode"], "disable");
+    let (out, _) = run_with(&with(&base, "sslmode=prefer"));
+    assert_eq!(out.status.code(), Some(2));
 }
