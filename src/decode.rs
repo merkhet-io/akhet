@@ -891,6 +891,33 @@ mod tests {
     }
 
     #[test]
+    fn many_values_roundtrip_bit_exact() {
+        // Correct rounding needs serde_json's float_roundtrip feature; the
+        // default parser is off by one ulp for some values (e.g. this one).
+        let mut vals = vec![96.32684451830643_f64];
+        let mut x = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let f = f64::from_bits(x);
+            if f.is_finite() {
+                vals.push(f);
+            }
+            vals.push(((x % 100_000) as f64 * 0.37).sin() * 1e3 / 7.0);
+        }
+        let ts: Vec<i64> = (1..=vals.len() as i64).collect();
+        let body =
+            serde_json::json!({"groups":[{"name":"g","timestamps":ts,"signals":{"x":vals}}]});
+        let d = cfg().decode_payload("sensors/h/batch", &serde_json::to_vec(&body).unwrap());
+        let got = &d.batches[0].values;
+        assert_eq!(got.len(), vals.len());
+        for (a, b) in got.iter().zip(&vals) {
+            assert_eq!(a.to_bits(), b.to_bits(), "{b:e}");
+        }
+    }
+
+    #[test]
     fn config_validation() {
         let base = |rule: &str| {
             DecoderConfig::from_json(
