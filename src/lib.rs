@@ -8,3 +8,4 @@ pub mod faults;
 pub mod receiver;
 pub mod replay;
 pub mod spool;
+pub mod timing;

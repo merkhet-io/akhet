@@ -156,6 +156,46 @@ round-trip through float64.
 Decoding does not interpret timing: it reports the publisher's timestamps
 as given. Converting timestamps to a uniform sample grid is a separate step.
 
+### Sample grid placement (read-only)
+
+`akhet grid --config <file> [--chunks [--samples]]` places decoded samples of
+each channel on a uniform grid (sample rate, anchor timestamp, integer sample
+offsets), the form a uniformly sampled store needs. Dropping per-sample
+timestamps is only honest when they lie on a regular grid, so placement is
+strict:
+
+- A sample within the tolerance of the next grid position is placed there.
+- A sample within tolerance of a *later* grid position ends the recording
+  (`gap`, with the number of missing grid positions); one off the grid ends it
+  as `off_grid` or, when the re-estimated rate differs, `rate_change`. The next
+  recording starts at that sample and records the discontinuity (reason,
+  previous recording, its last timestamp, gap length). Missing values are
+  never invented.
+- A timestamp at or before the latest one is never reordered: an exact repeat
+  (same timestamp and value bits, within the last `dedup_window_samples`) is
+  skipped as a duplicate, which absorbs redelivered batches; a different value
+  is a `conflict` issue; anything else is an `out_of_order` issue.
+- Samples are never interpolated, resampled or moved by more than the
+  tolerance. The reconstructed timestamp of sample `k` is
+  `anchor_unix_ns + round(k * 1e9 / rate_hz)`.
+
+Per rule, `timing` sets `rate_hz` (absent: estimated per recording from the
+median spacing of its first `estimate_samples` samples, rounded to
+`rate_resolution_hz`), `tolerance_ns` or `tolerance_fraction` of a period
+(default 0.1), `dedup_window_samples` (8192) and `max_chunk_samples` (32768).
+
+Recording keys are deterministic: `<source>/<group>/<signal>@<anchor_unix_ns>`
+(parts percent-encoded). Each chunk carries timing evidence: the original
+timestamps of its first and last sample and the maximum and RMS deviation from
+the grid. The summary reports per channel: samples in and placed, duplicates,
+conflicts, out-of-order and unplaced samples, recordings, splits by reason,
+missing samples in gaps, maximum and RMS reconstruction error, and
+`samples_beyond_tolerance` (zero by construction, reported as a check).
+
+The grid state of a channel is serializable so a replay sink can persist it
+atomically with its checkpoint. Clock drift of the source is not corrected; it
+shows up as growing deviation and, beyond the tolerance, as splits.
+
 ## Delivery semantics
 
 ### MQTT → spool: at-least-once, acknowledged after durable commit
@@ -332,7 +372,8 @@ graceful shutdown leaving uncommitted messages unacknowledged; Modbus timeout,
 exception and reconnect with explicit failed observations; concurrent-replayer
 exclusion and sink binding; TLS with a trusted and an untrusted CA; payload
 decoding of multi-group batches (bit-exact values) and explicit issues for
-malformed payloads.
+malformed payloads; grid placement with jitter, gaps, duplicates, conflicts,
+out-of-order samples, rate estimation and rate changes.
 
 Against an external broker (CI runs this with Mosquitto 2):
 
@@ -345,9 +386,9 @@ Modbus devices, long-duration soak tests, throughput or latency benchmarks.
 
 ## Scope boundaries
 
-- No MorletDB integration yet. `decode` supplies the payload schema, units and
-  channel identity; sampling rate, source clock, recording identity and gaps
-  still need an explicit contract. Irregular Modbus polls are not a uniform
+- No MorletDB integration yet. `decode` and `grid` supply payload schema,
+  units, channel and recording identity, sample rate and gaps; a sink that
+  writes them is not implemented. Irregular Modbus polls are not a uniform
   waveform.
 - No ML, adaptive discarding, Parquet conversion, custom storage engine,
   retention/deletion, fleet management or performance claims.
