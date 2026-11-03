@@ -107,10 +107,14 @@ async fn external_broker_redelivers_messages_left_unacked_by_graceful_shutdown()
         .collect();
     publish(port, "akhet-ext-pub2", &refs).await;
 
-    // Slow commits; SIGTERM after the first commit.
+    // Slow commits; SIGTERM after the first commit. Small group-commit
+    // batches keep messages queued behind the slow commits (with the default
+    // batch size one transaction would take all ten).
+    let mut slow = args(&p, "akhet-ext-shut", &filter);
+    slow.extend(["--max-batch", "2"]);
     let child = akhet(
         &db,
-        &args(&p, "akhet-ext-shut", &filter),
+        &slow,
         Some(&format!("delay:{}:300", point::COLLECTOR_COMMIT)),
     )
     .stdout(Stdio::piped())
