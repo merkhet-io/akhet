@@ -4,7 +4,7 @@
 mod support;
 
 use akhet::event::{Event, EventData, ModbusOutcome, ModbusPoll, sha256};
-use akhet::spool::{AppendOutcome, SourceClaim, Spool, SpoolError};
+use akhet::spool::{AppendOutcome, BatchItem, ItemErrors, SourceClaim, Spool, SpoolError};
 use rusqlite::params;
 use support::*;
 
@@ -104,6 +104,94 @@ fn identical_retry_is_idempotent_and_conflicting_reuse_is_rejected() {
     let recs = s.read_after(0, 10).unwrap();
     assert_eq!(recs.len(), 2);
     assert_eq!(recs[0].body, e.encode(), "original record untouched");
+}
+
+#[test]
+fn batch_append_has_per_item_dedup_and_conflict_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("s.sqlite");
+    let mut s = Spool::open(&db, MAX_DB).unwrap();
+    let stored = ev(vec![1]);
+    s.append(&stored, None).unwrap();
+    let a = ev(vec![2]).encode();
+    let b = ev(vec![3]).encode();
+    let mut conflicting = ev(vec![999]);
+    conflicting.event_id = stored.event_id.clone();
+    let conflicting = conflicting.encode();
+    let stored_body = stored.encode();
+    let claim = SourceClaim {
+        key: "k".into(),
+        content_sha256: sha256(b"x"),
+    };
+    let item = |body| BatchItem { body, source: None };
+    let items = [
+        item(&a),
+        item(&stored_body), // identical re-send of a stored event
+        item(&conflicting), // same event_id, different bytes
+        item(&a),           // duplicate of an item earlier in this batch
+        item(b"not json"),  // invalid format
+        BatchItem {
+            body: &b,
+            source: Some(&claim),
+        },
+    ];
+    let r = s.append_batch(&items, ItemErrors::Independent).unwrap();
+    assert_eq!(r.len(), 6);
+    assert_eq!(*r[0].as_ref().unwrap(), AppendOutcome::Inserted { seq: 2 });
+    assert_eq!(
+        *r[1].as_ref().unwrap(),
+        AppendOutcome::DuplicateEvent { seq: 1 }
+    );
+    assert!(matches!(
+        r[2],
+        Err(SpoolError::Conflict {
+            existing_seq: 1,
+            ..
+        })
+    ));
+    assert_eq!(
+        *r[3].as_ref().unwrap(),
+        AppendOutcome::DuplicateEvent { seq: 2 }
+    );
+    assert!(matches!(r[4], Err(SpoolError::Format(_))));
+    assert_eq!(*r[5].as_ref().unwrap(), AppendOutcome::Inserted { seq: 3 });
+    assert_eq!(bodies(&db), vec![stored_body.clone(), a.clone(), b.clone()]);
+
+    // StopAtFirst: items before the failure are committed, later ones are not
+    // attempted.
+    let c = ev(vec![4]).encode();
+    let d = ev(vec![5]).encode();
+    let items = [item(&c), item(&conflicting), item(&d)];
+    let r = s.append_batch(&items, ItemErrors::StopAtFirst).unwrap();
+    assert_eq!(r.len(), 2);
+    assert_eq!(*r[0].as_ref().unwrap(), AppendOutcome::Inserted { seq: 4 });
+    assert!(r[1].is_err());
+    assert_eq!(count(&db), 4);
+    assert_eq!(s.verify().unwrap(), 4);
+}
+
+#[test]
+fn failed_batch_transaction_stores_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("s.sqlite");
+    let mut s = Spool::open(&db, 64 * 1024).unwrap();
+    s.append(&ev(vec![1]), None).unwrap();
+    // One batch far larger than the database-size limit: the transaction
+    // fails as a whole and rolls back, including the rows that did fit.
+    let bodies_: Vec<Vec<u8>> = (0..200).map(|_| ev(vec![7; 125]).encode()).collect();
+    let items: Vec<BatchItem<'_>> = bodies_
+        .iter()
+        .map(|b| BatchItem {
+            body: b,
+            source: None,
+        })
+        .collect();
+    let err = s
+        .append_batch(&items, ItemErrors::Independent)
+        .expect_err("over capacity");
+    assert!(err.is_capacity(), "{err}");
+    assert_eq!(s.status().unwrap().records, 1);
+    assert_eq!(s.verify().unwrap(), 1);
 }
 
 #[test]

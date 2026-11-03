@@ -408,3 +408,127 @@ fn sigterm(pid: u32) {
         .unwrap();
     assert!(st.success());
 }
+
+const BATCHED: &[&str] = &["--records-per-request", "10"];
+
+#[test]
+fn batched_replay_is_byte_identical_and_deduplicated_per_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("spool.sqlite");
+    seed(&db, 5);
+    let rx = TestReceiver::start(&dir.path().join("rx.sqlite"));
+    let s = stdout_json(&replay(&db, &rx.url, "main", None, BATCHED));
+    assert_eq!(s["batch_protocol"], true, "{s}");
+    assert_eq!(s["requests"], 1, "{s}");
+    assert_eq!(s["delivered"], 5);
+    assert_eq!(bodies(&rx.db), bodies(&db));
+    assert_eq!(checkpoint(&db, "main"), 5);
+    let s = stdout_json(&replay(&db, &rx.url, "second", None, BATCHED));
+    assert_eq!(s["delivered"], 5);
+    assert_eq!(s["receiver_duplicates"], 5);
+    assert_eq!(rx.count(), 5);
+}
+
+#[test]
+fn batched_replay_falls_back_to_single_posts_without_the_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("spool.sqlite");
+    seed(&db, 3);
+    let rx = TestReceiver::start_without_batch(&dir.path().join("rx.sqlite"));
+    let s = stdout_json(&replay(&db, &rx.url, "s", None, BATCHED));
+    assert_eq!(s["batch_protocol"], false, "{s}");
+    assert_eq!(s["requests"], 3);
+    assert_eq!(s["delivered"], 3);
+    assert_eq!(bodies(&rx.db), bodies(&db));
+}
+
+#[test]
+fn batched_replay_respects_request_size_and_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("spool.sqlite");
+    seed(&db, 5);
+    let rx = TestReceiver::start(&dir.path().join("rx.sqlite"));
+    let one = bodies(&db)[0].len();
+    // Room for two framed records per request.
+    let max = (2 * (one + 160)).to_string();
+    let s = stdout_json(&replay(
+        &db,
+        &rx.url,
+        "s",
+        None,
+        &[BATCHED, &["--max-request-bytes", &max, "--limit", "4"]].concat(),
+    ));
+    assert_eq!(s["delivered"], 4, "{s}");
+    assert_eq!(s["requests"], 2, "{s}");
+    assert_eq!(checkpoint(&db, "s"), 4);
+    assert_eq!(rx.count(), 4);
+}
+
+#[test]
+fn batched_crash_after_remote_commit_resends_the_batch_and_receiver_dedups() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("spool.sqlite");
+    seed(&db, 3);
+    let rx = TestReceiver::start(&dir.path().join("rx.sqlite"));
+    let out = replay(
+        &db,
+        &rx.url,
+        "s",
+        Some(&format!("abort:{}", point::REPLAY_AFTER_REMOTE_SUCCESS)),
+        BATCHED,
+    );
+    assert!(killed_by_signal(&out));
+    assert_eq!(rx.count(), 3, "receiver committed the whole batch");
+    assert_eq!(checkpoint(&db, "s"), 0, "checkpoint not advanced");
+    let s = stdout_json(&replay(&db, &rx.url, "s", None, BATCHED));
+    assert_eq!(s["delivered"], 3);
+    assert_eq!(s["receiver_duplicates"], 3, "whole batch sent twice");
+    assert_eq!(rx.count(), 3, "no duplicate receiver records");
+    assert_eq!(checkpoint(&db, "s"), 3);
+}
+
+#[test]
+fn batched_crash_after_checkpoint_does_not_resend() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("spool.sqlite");
+    seed(&db, 3);
+    let rx = TestReceiver::start(&dir.path().join("rx.sqlite"));
+    let out = replay(
+        &db,
+        &rx.url,
+        "s",
+        Some(&format!("abort:{}", point::REPLAY_AFTER_CHECKPOINT)),
+        BATCHED,
+    );
+    assert!(killed_by_signal(&out));
+    assert_eq!(checkpoint(&db, "s"), 3);
+    let s = stdout_json(&replay(&db, &rx.url, "s", None, BATCHED));
+    assert_eq!(s["delivered"], 0);
+    assert_eq!(rx.count(), 3);
+}
+
+#[test]
+fn batched_conflict_advances_checkpoint_over_the_successful_prefix_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("spool.sqlite");
+    let evs = seed(&db, 3);
+    let rx = TestReceiver::start(&dir.path().join("rx.sqlite"));
+    {
+        let mut v: serde_json::Value = serde_json::from_slice(&evs[1].encode()).unwrap();
+        v["registers"] = serde_json::json!([4242]);
+        let mut r = Spool::open(&rx.db, MAX_DB).unwrap();
+        r.append_body(&serde_json::to_vec(&v).unwrap(), None)
+            .unwrap();
+    }
+    let out = replay(&db, &rx.url, "s", None, BATCHED);
+    assert_eq!(out.status.code(), Some(EXIT_REJECTED));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("HTTP 409"));
+    assert_eq!(
+        checkpoint(&db, "s"),
+        1,
+        "stops before the conflicting record"
+    );
+    // The receiver stored the records it accepted, including the one after
+    // the conflict; a later replay would see it as a duplicate.
+    assert_eq!(rx.count(), 3);
+}
