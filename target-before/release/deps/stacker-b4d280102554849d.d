@@ -1,0 +1,10 @@
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/stacker-b4d280102554849d.d: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/backends/mod.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/backends/macos.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/mmap_stack_restore_guard.rs
+
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/libstacker-b4d280102554849d.rlib: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/backends/mod.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/backends/macos.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/mmap_stack_restore_guard.rs
+
+/private/tmp/claude-502/-Users-zin-sophia-bdim/de55b961-3d77-482a-bbb7-6c8fdaa0b261/scratchpad/wt/morlet-acq/target-before/release/deps/libstacker-b4d280102554849d.rmeta: /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/lib.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/backends/mod.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/backends/macos.rs /Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/mmap_stack_restore_guard.rs
+
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/lib.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/backends/mod.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/backends/macos.rs:
+/Users/zin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/stacker-0.1.25/src/mmap_stack_restore_guard.rs:

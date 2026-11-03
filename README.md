@@ -265,26 +265,51 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
   estimated, the tolerance and the discontinuity that started it. Chunks go
   through `morlet_append_chunk` at the grid's sample offsets; values are sent
   as binary float64 and read back bit-exactly.
-- **Acquisitions:** each source is one MorletDB acquisition, so all of its
-  channels can be read on one time axis with
-  `morlet_read_acquisition(collection, '<source>', t_start_ns, t_end_ns)`.
-  Times are nanoseconds from the acquisition's origin.
-  - **Id and machine:** the source name.
-  - **Origin:** the anchor of the source's first recording, truncated to the
-    microsecond (`timestamptz` resolution).
-  - **Channels:** every recording becomes a channel when it starts, with role
-    `<group>/<signal>@<anchor unix ns>`, `offset_ns` = anchor − origin
-    (exact), clock `daq` and offset uncertainty = the grid tolerance.
-  - **Discontinuities:** MorletDB allows one recording per role, and a
-    channel starts a new recording after a discontinuity. The role therefore
-    names the recording; the part before `@` is the channel. One acquisition
-    per source keeps every recording, old and new, on the same time axis.
-  - **Transactions:** registration happens in the same transaction as the
-    samples. MorletDB accepts identical retries.
+- **Acquisitions:** a source's recordings are grouped into bounded MorletDB
+  acquisitions. Each acquisition is a run of the source from one boundary to
+  the next. Every channel is cut at the boundary, so each acquisition holds
+  exactly one recording per channel, and channels keep a stable role
+  `<group>/<signal>` across acquisitions.
+  - **Reading:** `morlet_read_acquisition(collection, id, t_start_ns,
+    t_end_ns)` reads all channels of one run on one time axis (nanoseconds
+    from the origin). `morlet_compare_acquisition` and history comparisons
+    can match channels by role across runs.
+  - **Boundaries (a new acquisition starts):**
+    - at the source's first recording;
+    - at a discontinuity of any channel (gap, off-grid sample, rate change);
+    - at a change of a context key listed in `--acquisition-context`
+      (repeatable or comma-separated, e.g. `program`);
+    - at multiples of `--acquisition-period-s` since the Unix epoch
+      (default 86400: every UTC midnight; `0` disables).
+  - **Cutting:** at a boundary, every waveform channel of the source is cut
+    on its own grid. The recording ends before the first sample at or after
+    the boundary, and a new recording starts there with the same rate:
+    nothing is lost, repeated or re-estimated. The recording metadata holds
+    `cut_at_unix_ns`, and the grid report counts `splits_cut`.
+    - A channel whose samples are already past the boundary (a context
+      message that arrived late) is cut at its next sample. Its offset in
+      the new acquisition is then slightly positive, and still exact.
+    - A channel seen for the first time after boundaries were declared (data
+      arriving late) is cut at the last 16 boundaries of its source and
+      registered in the matching acquisitions.
+    - If a late channel would need a role that is already taken in a past
+      acquisition, its recording is not registered there, and an issue of
+      kind `role_taken` is written.
+  - **Id and origin:** id `<source>@<origin unix ns>`, machine = the source
+    name. The origin is the boundary truncated to the microsecond
+    (`timestamptz` resolution). Each channel's `offset_ns` is its first
+    sample's time minus the origin (exact), with clock `daq` and offset
+    uncertainty = the grid tolerance.
+  - **Metadata:** each acquisition records why it was opened
+    (`akhet.opened_by`: `start`, `discontinuity`, `context` with key and
+    values, `period`, or `role_reused`).
+  - **Creation:** an acquisition is created with its first channel, so a
+    boundary that no samples follow creates nothing. Registration is in the
+    same transaction as the samples; MorletDB accepts identical retries.
   - **Enabling:** `--create-collection` enables acquisitions on the
     collection (also on an existing one). Without that flag, a collection
-    without acquisition tables gets a warning and no registration.
-    `--no-acquisitions` turns registration off.
+    without acquisition tables gets a warning and no registration or cuts.
+    `--no-acquisitions` turns both off.
   - **Context:** still written per recording (below), not with
     `morlet_add_acquisition_context`.
 - **Chunks:** within one transaction, the contiguous samples of a recording
@@ -825,7 +850,8 @@ hardware are still missing.
 
 `examples/morlet_sink.rs` measures the MorletDB sink (samples/s, chunks/s,
 time per transaction, sink state size) for a configurable payload shape
-against `AKHET_MORLET_URL`; see the MorletDB section of the same document.
+against `AKHET_MORLET_URL`; see the MorletDB section of the same document. `examples/morlet_acquisition.rs` times
+`morlet_read_acquisition` on a source with many gaps.
 
 ## Scope boundaries
 

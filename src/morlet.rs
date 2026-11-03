@@ -68,9 +68,14 @@ pub struct MorletConfig {
     pub collection: String,
     /// Create the collection (and its context tables) if missing.
     pub create_collection: bool,
-    /// Register each source as a MorletDB acquisition and each recording as
-    /// one of its channels (see [`acquisition_role`]).
+    /// Register each source's recordings as channels of bounded MorletDB
+    /// acquisitions (see [`open_acquisition`]).
     pub acquisitions: bool,
+    /// Context keys whose change starts a new acquisition of the source.
+    pub acquisition_context: Vec<String>,
+    /// Maximum acquisition duration: acquisitions end at multiples of this
+    /// period since the Unix epoch (86400: UTC midnight). None: no limit.
+    pub acquisition_period_s: Option<u64>,
     pub decoder: DecoderConfig,
     /// Spool records per database transaction.
     pub records_per_tx: usize,
@@ -96,6 +101,8 @@ impl MorletConfig {
             collection: collection.into(),
             create_collection: false,
             acquisitions: true,
+            acquisition_context: Vec::new(),
+            acquisition_period_s: Some(86_400),
             decoder,
             records_per_tx: 100,
             window_size: 512,
@@ -163,24 +170,103 @@ struct SourceCtx {
     recordings: BTreeMap<String, RecSpan>,
     intervals: BTreeMap<String, Vec<Interval>>,
     latest_context_ns: Option<i64>,
-    /// Origin of the source's MorletDB acquisition (unix ns, a whole
-    /// microsecond), set when its first recording is registered.
+    /// Grid keys of the source's waveform channels.
     #[serde(default)]
-    acquisition_origin_ns: Option<i64>,
+    channels: std::collections::BTreeSet<String>,
+    /// The source's most recent acquisitions, ascending; the last is the
+    /// current one. Older ones are kept for channels whose data arrives late.
+    #[serde(default)]
+    acquisitions: Vec<SourceAcquisition>,
 }
 
-/// Role of a recording in its source's acquisition: `<group>/<signal>@<anchor
-/// unix ns>`. MorletDB allows one recording per role, and a channel starts a
-/// new recording after each discontinuity, so the role names the recording;
-/// the part before `@` is the channel.
-pub fn acquisition_role(group: &str, signal: &str, anchor_unix_ns: i64) -> String {
-    format!("{group}/{signal}@{anchor_unix_ns}")
+/// Acquisitions kept per source for late channels.
+const RETAINED_ACQUISITIONS: usize = 16;
+
+impl SourceCtx {
+    /// Index of the acquisition whose time range contains `unix_ns` (the
+    /// first retained one for earlier times).
+    fn acquisition_at(&self, unix_ns: i64) -> Option<usize> {
+        let n = self
+            .acquisitions
+            .partition_point(|a| a.boundary_ns <= unix_ns);
+        (!self.acquisitions.is_empty()).then(|| n.saturating_sub(1))
+    }
 }
 
-/// Acquisition origin for a first anchor: truncated to the microsecond, the
+/// One bounded acquisition of a source: from a boundary to the next.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceAcquisition {
+    /// `<source>@<origin_unix_ns>`.
+    id: String,
+    /// Unix ns, a whole microsecond (`timestamptz` resolution).
+    origin_ns: i64,
+    /// The boundary it starts at (unix ns): channels are cut here.
+    boundary_ns: i64,
+    /// Why it was opened (stored in the acquisition's metadata).
+    opened_by: Value,
+    /// Created in MorletDB (lazily, with its first channel).
+    created: bool,
+    /// Roles registered so far (`<group>/<signal>`, one recording each).
+    roles: std::collections::BTreeSet<String>,
+}
+
+/// Acquisition origin for a boundary: truncated to the microsecond, the
 /// resolution of `timestamptz`, so channel offsets stay exact nanoseconds.
-fn acquisition_origin(anchor_unix_ns: i64) -> i64 {
-    anchor_unix_ns - anchor_unix_ns.rem_euclid(1000)
+fn acquisition_origin(unix_ns: i64) -> i64 {
+    unix_ns - unix_ns.rem_euclid(1000)
+}
+
+/// Stable role of a channel in every acquisition of its source.
+pub fn acquisition_role(group: &str, signal: &str) -> String {
+    format!("{group}/{signal}")
+}
+
+/// Start a new acquisition of `source` at `boundary` and cut every
+/// waveform channel of the source there ([`ChannelGrid::cut_at`]): each
+/// channel's recording ends before its first sample at or after the
+/// boundary (or its next sample, if it is already past it), and the
+/// recordings that follow are the new acquisition's channels. Returns false
+/// (and does nothing) if the boundary is not after the current origin.
+fn open_acquisition(
+    src: &mut SourceCtx,
+    grids: &mut BTreeMap<String, ChannelGrid>,
+    source: &str,
+    boundary: i64,
+    opened_by: Value,
+) -> bool {
+    let origin = acquisition_origin(boundary);
+    if src
+        .acquisitions
+        .last()
+        .is_some_and(|a| origin <= a.origin_ns)
+    {
+        return false;
+    }
+    src.acquisitions.push(SourceAcquisition {
+        id: format!("{source}@{origin}"),
+        origin_ns: origin,
+        boundary_ns: boundary,
+        opened_by,
+        created: false,
+        roles: Default::default(),
+    });
+    let excess = src.acquisitions.len().saturating_sub(RETAINED_ACQUISITIONS);
+    src.acquisitions.drain(..excess);
+    for k in &src.channels {
+        if let Some(g) = grids.get_mut(k) {
+            g.cut_at(boundary);
+        }
+    }
+    true
+}
+
+/// The period boundary a batch reaching `last_ns` crosses for an acquisition
+/// at `origin_ns`, if any: the latest multiple of the period at or before
+/// `last_ns` that is after the origin.
+fn period_boundary(origin_ns: i64, last_ns: i64, period_s: u64) -> Option<i64> {
+    let p = i64::try_from(period_s).ok()?.checked_mul(1_000_000_000)?;
+    let b = last_ns.div_euclid(p) * p;
+    (b > origin_ns).then_some(b)
 }
 
 fn unix_ns_to_system_time(ns: i64) -> std::time::SystemTime {
@@ -805,16 +891,38 @@ fn write_batch(
         };
         for b in &d.batches {
             let key = b.channel.key();
-            let grid = match state.grids.get_mut(&key) {
-                Some(g) => g,
-                None => {
-                    let g = ChannelGrid::new(key.clone(), spec.clone())
-                        .map_err(|e| TxError::Fatal(ReplayError::Config(e)))?;
-                    state.grids.entry(key.clone()).or_insert(g)
-                }
-            };
-            let outputs = grid.push(&b.timestamps_unix_ns, &b.values);
+            if !state.grids.contains_key(&key) {
+                let g = ChannelGrid::new(key.clone(), spec.clone())
+                    .map_err(|e| TxError::Fatal(ReplayError::Config(e)))?;
+                state.grids.insert(key.clone(), g);
+            }
             let src = state.sources.entry(b.channel.source.clone()).or_default();
+            if src.channels.insert(key.clone()) {
+                // A channel seen for the first time (possibly late): cut it
+                // at the boundaries already known.
+                let g = state.grids.get_mut(&key).expect("inserted above");
+                for a in &src.acquisitions {
+                    g.cut_at(a.boundary_ns);
+                }
+            }
+            if sess.acquisitions
+                && let (Some(period), Some(a), Some(&last)) = (
+                    cfg.acquisition_period_s,
+                    src.acquisitions.last(),
+                    b.timestamps_unix_ns.last(),
+                )
+                && let Some(boundary) = period_boundary(a.origin_ns, last, period)
+            {
+                open_acquisition(
+                    src,
+                    &mut state.grids,
+                    &b.channel.source,
+                    boundary,
+                    json!({"reason": "period", "period_s": period}),
+                );
+            }
+            let grid = state.grids.get_mut(&key).expect("inserted above");
+            let outputs = grid.push(&b.timestamps_unix_ns, &b.values);
             if !touched.contains(&b.channel.source) {
                 touched.push(b.channel.source.clone());
             }
@@ -836,6 +944,7 @@ fn write_batch(
                                 "rate_estimated": s.rate_estimated,
                                 "tolerance_ns": s.tolerance_ns,
                                 "discontinuity": s.discontinuity,
+                                "cut_at_unix_ns": s.cut_at_unix_ns,
                             }),
                         );
                         tx.execute(
@@ -857,41 +966,98 @@ fn write_batch(
                         .map_err(classify)?;
                         if sess.acquisitions {
                             let source = &b.channel.source;
-                            let origin = match src.acquisition_origin_ns {
-                                Some(o) => o,
-                                None => {
-                                    let o = acquisition_origin(s.anchor_unix_ns);
-                                    tx.execute(
-                                        "SELECT morlet_create_acquisition($1::text::regclass,$2,$3,$4,$5)",
-                                        &[
-                                            &coll,
-                                            source,
-                                            source,
-                                            &unix_ns_to_system_time(o),
-                                            &json!({"akhet": {"source": source, "origin_unix_ns": o}}),
-                                        ],
-                                    )
-                                    .map_err(classify)?;
-                                    src.acquisition_origin_ns = Some(o);
-                                    o
+                            let role = acquisition_role(&b.channel.group, &b.channel.signal);
+                            match (src.acquisitions.is_empty(), &s.discontinuity) {
+                                (true, _) => {
+                                    open_acquisition(
+                                        src,
+                                        &mut state.grids,
+                                        source,
+                                        s.anchor_unix_ns,
+                                        json!({"reason": "start"}),
+                                    );
                                 }
-                            };
-                            tx.execute(
+                                (false, Some(d)) => {
+                                    // No-op unless after the current origin.
+                                    open_acquisition(
+                                        src,
+                                        &mut state.grids,
+                                        source,
+                                        s.anchor_unix_ns,
+                                        json!({"reason": "discontinuity", "role": role, "split": d.reason}),
+                                    );
+                                }
+                                _ => {}
+                            }
+                            let mut idx =
+                                src.acquisition_at(s.anchor_unix_ns).expect("opened above");
+                            let last = src.acquisitions.len() - 1;
+                            // One recording per role and acquisition.
+                            if src.acquisitions[idx].roles.contains(&role) {
+                                let boundary = s
+                                    .anchor_unix_ns
+                                    .max(src.acquisitions[last].origin_ns + 1000);
+                                if idx == last
+                                    && open_acquisition(
+                                        src,
+                                        &mut state.grids,
+                                        source,
+                                        boundary,
+                                        json!({"reason": "role_reused", "role": role}),
+                                    )
+                                {
+                                    idx = src.acquisitions.len() - 1;
+                                } else {
+                                    // A late channel restarting inside a past
+                                    // acquisition: reported, not registered.
+                                    issue(
+                                        &mut tx,
+                                        stats,
+                                        "acquisition",
+                                        json!({
+                                            "kind": "role_taken",
+                                            "acquisition": src.acquisitions[idx].id,
+                                            "role": role,
+                                            "recording": s.recording,
+                                        }),
+                                    )?;
+                                    idx = usize::MAX;
+                                }
+                            }
+                            if let Some(a) = src.acquisitions.get_mut(idx) {
+                                if !a.created {
+                                    tx.execute(
+                                    "SELECT morlet_create_acquisition($1::text::regclass,$2,$3,$4,$5)",
+                                    &[
+                                        &coll,
+                                        &a.id,
+                                        source,
+                                        &unix_ns_to_system_time(a.origin_ns),
+                                        &json!({"akhet": {
+                                            "source": source,
+                                            "origin_unix_ns": a.origin_ns,
+                                            "boundary_unix_ns": a.boundary_ns,
+                                            "opened_by": a.opened_by,
+                                        }}),
+                                    ],
+                                )
+                                .map_err(classify)?;
+                                    a.created = true;
+                                }
+                                tx.execute(
                                 "SELECT morlet_add_acquisition_channel($1::text::regclass,$2,$3,$4,$5,'daq',$6)",
                                 &[
                                     &coll,
-                                    source,
+                                    &a.id,
                                     &s.recording,
-                                    &acquisition_role(
-                                        &b.channel.group,
-                                        &b.channel.signal,
-                                        s.anchor_unix_ns,
-                                    ),
-                                    &(s.anchor_unix_ns - origin),
+                                    &role,
+                                    &(s.anchor_unix_ns - a.origin_ns),
                                     &(s.tolerance_ns.ceil() as i64),
                                 ],
                             )
                             .map_err(classify)?;
+                                a.roles.insert(role);
+                            }
                         }
                         src.recordings.insert(
                             s.recording.clone(),
@@ -965,6 +1131,18 @@ fn write_batch(
             for o in outputs {
                 match o {
                     ContextOutput::Change(c) => {
+                        if sess.acquisitions
+                            && !src.acquisitions.is_empty()
+                            && cfg.acquisition_context.contains(&b.channel.signal)
+                        {
+                            open_acquisition(
+                                src,
+                                &mut state.grids,
+                                &b.channel.source,
+                                c.unix_ns,
+                                json!({"reason": "context", "key": b.channel.signal, "value": c.value, "previous": c.previous}),
+                            );
+                        }
                         current.insert(
                             (b.channel.source.clone(), b.channel.signal.clone()),
                             (c.value.clone(), c.unix_ns, c.collected_unix_ns, rec.seq),
@@ -1230,7 +1408,19 @@ mod tests {
                 .as_nanos(),
             1_000_000_123_000
         );
-        assert_eq!(acquisition_role("vib", "x", 42), "vib/x@42");
+        assert_eq!(acquisition_role("vib", "x"), "vib/x");
+    }
+
+    #[test]
+    fn period_boundaries_are_epoch_multiples_after_the_origin() {
+        let day = 86_400u64;
+        let d = 86_400_000_000_000i64;
+        let t = 20_000 * d + 3_600_000_000_000; // 01:00 UTC
+        assert_eq!(period_boundary(t, t + 1000, day), None);
+        assert_eq!(period_boundary(t, 20_001 * d, day), Some(20_001 * d));
+        // Several days later: the latest midnight, not the first one.
+        assert_eq!(period_boundary(t, 20_003 * d + 5, day), Some(20_003 * d));
+        assert_eq!(period_boundary(20_001 * d, 20_001 * d + 5, day), None);
     }
 
     #[test]

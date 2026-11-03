@@ -76,7 +76,10 @@ const DECODER: &str = r#"{"format_version":1,"rules":[
    "context_signals":["program"]},
   {"name":"temp","topic":"plant/+/temp","source":"{topic.1}","group":"thermal",
    "timestamps":"/t","timestamp_unit":"us","signals":{"list":[{"name":"temp","pointer":"/temp"}]},
-   "units":{"temp":"degC"},"timing":{"rate_hz":1000,"tolerance_ns":2000}}]}"#;
+   "units":{"temp":"degC"},"timing":{"rate_hz":1000,"tolerance_ns":2000}},
+  {"name":"pressure","topic":"plant/+/pressure","source":"{topic.1}","group":"hydraulic",
+   "timestamps":"/t","timestamp_unit":"us","signals":{"list":[{"name":"pressure","pointer":"/pressure"}]},
+   "units":{"pressure":"bar"},"timing":{"rate_hz":1000,"tolerance_ns":2000}}]}"#;
 
 /// Spool: batches 0..6 regular, batch 3 redelivered, a 100-sample gap,
 /// then batches 7..9 regular; program changes 11 -> 2011 -> 11.
@@ -802,62 +805,95 @@ fn dedup_windows_are_stored_incrementally_and_migrated() {
     }
 }
 
-/// One source with two rates: the 40 kHz vibration recordings and a 1 kHz
-/// temperature recording starting 5 ms later are channels of one
-/// acquisition, and a time-interval read returns for every channel the
-/// samples of its own recording at the right offsets.
+/// Acquisitions are bounded runs: all recordings of a source are cut
+/// together at a context change (`--acquisition-context program`), at UTC
+/// midnight (`--acquisition-period-s 86400`) and at a discontinuity of any
+/// channel. Each acquisition holds one recording per stable role
+/// `<group>/<signal>`, and reading every acquisition gives back each
+/// channel's samples exactly. A channel whose data arrives after all of that
+/// (late) is cut at the same boundaries and registered in the same
+/// acquisitions.
 #[test]
 #[ignore = "needs AKHET_TEST_MORLET_URL"]
-fn sources_are_acquisitions_read_on_one_time_axis() {
+fn acquisitions_are_bounded_runs_with_stable_roles() {
+    // B is 50 ms before a UTC midnight (1 700 006 400 s = 19 675 days).
+    const B_US: i64 = 1_700_006_400_000_000 - 50_000;
     let dir = tempfile::tempdir().unwrap();
     let spool = dir.path().join("s.sqlite");
-    build_spool(&spool);
+    let vib = |s: usize, k: i64| value(s, k);
+    let temp = |k: i64| 20.0 + k as f64 / 8.0;
+    let pressure = |k: i64| 5.0 + k as f64 / 16.0;
     {
         let mut sp = Spool::open(&spool, MAX_DB).unwrap();
-        for m in 0..3i64 {
-            let t: Vec<i64> = (0..20)
-                .map(|i| T0_US + 5_000 + (m * 20 + i) * 1_000)
-                .collect();
-            let temp: Vec<f64> = (0..20).map(|i| 20.0 + (m * 20 + i) as f64 / 8.0).collect();
-            let p = serde_json::to_vec(&serde_json::json!({"t": t, "temp": temp})).unwrap();
-            sp.append(&mqtt_event("plant/hub-1/temp", &p), None)
+        let mut add = |topic: &str, p: serde_json::Value| {
+            sp.append(&mqtt_event(topic, &serde_json::to_vec(&p).unwrap()), None)
                 .unwrap();
+        };
+        add(
+            "plant/hub-1/controller",
+            serde_json::json!({"t": [B_US / 1000], "program": [11]}),
+        );
+        for m in 0..10i64 {
+            // 10 ms per message; the program changes at 25 ms (published
+            // when it happens, before the sensor batch covering it).
+            if m == 2 {
+                add(
+                    "plant/hub-1/controller",
+                    serde_json::json!({"t": [B_US / 1000 + 25], "program": [2011]}),
+                );
+            }
+            // 40 kHz: no message for 60..70 ms (a gap).
+            if m != 6 {
+                let ks: Vec<i64> = (m * 400..(m + 1) * 400).collect();
+                let ts: Vec<i64> = ks.iter().map(|k| B_US + k * 25).collect();
+                let x: Vec<f64> = ks.iter().map(|&k| vib(0, k)).collect();
+                let y: Vec<f64> = ks.iter().map(|&k| vib(1, k)).collect();
+                add(
+                    "sensors/hub-1/batch",
+                    serde_json::json!({"groups":[{"name":"vib","timestamps":ts,"signals":{"accel_x":x,"accel_y":y}}]}),
+                );
+            }
+            let ks: Vec<i64> = (m * 10..(m + 1) * 10).collect();
+            let ts: Vec<i64> = ks.iter().map(|k| B_US + k * 1000).collect();
+            let v: Vec<f64> = ks.iter().map(|&k| temp(k)).collect();
+            add("plant/hub-1/temp", serde_json::json!({"t": ts, "temp": v}));
         }
+        // A late channel: all of its data after everything else.
+        let ks: Vec<i64> = (0..100).collect();
+        let ts: Vec<i64> = ks.iter().map(|k| B_US + k * 1000).collect();
+        let v: Vec<f64> = ks.iter().map(|&k| pressure(k)).collect();
+        add(
+            "plant/hub-1/pressure",
+            serde_json::json!({"t": ts, "pressure": v}),
+        );
     }
     let cfg = decoder_file(dir.path());
     let coll = unique("akhet_acq");
+    let sink = unique("s");
     let out = morlet_run_args(
         &spool,
         &cfg,
-        &unique("s"),
+        &sink,
         &coll,
         None,
-        &["--records-per-tx", "100"],
+        &[
+            "--acquisition-context",
+            "program",
+            "--acquisition-period-s",
+            "86400",
+        ],
     );
     assert!(out.status.success());
+    assert_eq!(timing_issues(&sink), 0);
     let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
-    let acq = db
+    let b_ns = B_US * 1000;
+    let ms = 1_000_000i64;
+    let acqs: Vec<(String, i64, String, String)> = db
         .query(
             &format!(
-                "SELECT acquisition_id, machine, (extract(epoch FROM origin_utc) * 1000000)::int8 FROM {coll}_acq"
-            ),
-            &[],
-        )
-        .unwrap();
-    assert_eq!(acq.len(), 1);
-    let (id, machine, origin_us): (String, String, i64) =
-        (acq[0].get(0), acq[0].get(1), acq[0].get(2));
-    assert_eq!(
-        (id.as_str(), machine.as_str(), origin_us),
-        ("hub-1", "hub-1", T0_US)
-    );
-    let gap_ns = (6 * N as i64 + 100) * 25_000;
-    let t0_ns = T0_US * 1000;
-    let channels: Vec<(String, i64, String, i64)> = db
-        .query(
-            &format!(
-                "SELECT role, offset_ns, clock_source, offset_uncertainty_ns FROM {coll}_acq_channels
-                 WHERE acquisition_id='hub-1' ORDER BY role"
+                "SELECT acquisition_id, (extract(epoch FROM origin_utc) * 1000000)::int8 * 1000,
+                        machine, metadata->'akhet'->'opened_by'->>'reason'
+                 FROM {coll}_acq ORDER BY origin_utc"
             ),
             &[],
         )
@@ -865,65 +901,81 @@ fn sources_are_acquisitions_read_on_one_time_axis() {
         .iter()
         .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
         .collect();
-    let ch = |role: String, off: i64, tol: i64| (role, off, "daq".to_string(), tol);
-    assert_eq!(
-        channels,
-        vec![
-            ch(
-                format!("thermal/temp@{}", t0_ns + 5_000_000),
-                5_000_000,
-                2000
-            ),
-            ch(format!("vib/accel_x@{t0_ns}"), 0, 2000),
-            ch(format!("vib/accel_x@{}", t0_ns + gap_ns), gap_ns, 2000),
-            ch(format!("vib/accel_y@{t0_ns}"), 0, 2000),
-            ch(format!("vib/accel_y@{}", t0_ns + gap_ns), gap_ns, 2000),
-        ]
-    );
-
-    // [10 ms, 70 ms) in acquisition time.
-    let rows = db
-        .query(
-            "SELECT role, recording_id, start_sample, end_sample, samples
-             FROM morlet_read_acquisition($1::text::regclass, 'hub-1', 10000000, 70000000) ORDER BY role",
-            &[&coll],
+    let want: Vec<(String, i64, String, String)> = [
+        (0, "start"),
+        (25, "context"),
+        (50, "period"),
+        (70, "discontinuity"),
+    ]
+    .iter()
+    .map(|&(t, why)| {
+        let o = b_ns + t * ms;
+        (
+            format!("hub-1@{o}"),
+            o,
+            "hub-1".to_string(),
+            why.to_string(),
         )
-        .unwrap();
-    let got: Vec<(String, i64, i64)> = rows
-        .iter()
-        .map(|r| (r.get(0), r.get(2), r.get(3)))
-        .collect();
-    assert_eq!(
-        got,
-        vec![
-            // 1 kHz from 5 ms: samples 5..60 (the recording has 60).
-            (format!("thermal/temp@{}", t0_ns + 5_000_000), 5, 60),
-            // 40 kHz from 0: samples 400..2400 (the recording has 2400).
-            (format!("vib/accel_x@{t0_ns}"), 400, 2400),
-            // 40 kHz from 62.5 ms: samples 0..300.
-            (format!("vib/accel_x@{}", t0_ns + gap_ns), 0, 300),
-            (format!("vib/accel_y@{t0_ns}"), 400, 2400),
-            (format!("vib/accel_y@{}", t0_ns + gap_ns), 0, 300),
-        ]
-    );
-    for r in &rows {
-        let (rec, s, e, samples): (String, i64, i64, Vec<f64>) =
-            (r.get(1), r.get(2), r.get(3), r.get(4));
-        let direct: Vec<f64> = db
-            .query_one(
-                "SELECT samples FROM morlet_read_interval($1::text::regclass, $2, $3, $4)",
-                &[&coll, &rec, &s, &e],
+    })
+    .collect();
+    assert_eq!(acqs, want);
+
+    // Every acquisition: the same four roles, each starting at the origin.
+    let roles = [
+        "hydraulic/pressure",
+        "thermal/temp",
+        "vib/accel_x",
+        "vib/accel_y",
+    ];
+    for (id, _, _, _) in &acqs {
+        let ch: Vec<(String, i64)> = db
+            .query(
+                &format!(
+                    "SELECT role, offset_ns FROM {coll}_acq_channels WHERE acquisition_id=$1 ORDER BY role"
+                ),
+                &[id],
             )
             .unwrap()
-            .get(0);
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
         assert_eq!(
-            samples.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            direct.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            "{rec}"
+            ch,
+            roles.iter().map(|r| (r.to_string(), 0)).collect::<Vec<_>>(),
+            "{id}"
         );
     }
-    let temp: Vec<f64> = rows[0].get(4);
-    assert_eq!(temp[0], 20.0 + 5.0 / 8.0);
+
+    // Reading each acquisition over its whole span and concatenating per
+    // role gives back every channel, bit-exact (40 kHz without 60..70 ms).
+    let ends = [25, 50, 70, 100];
+    let mut got: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for ((id, origin, _, _), end) in acqs.iter().zip(ends) {
+        let len = b_ns + end * ms - origin;
+        for r in db
+            .query(
+                "SELECT role, samples FROM morlet_read_acquisition($1::text::regclass, $2, 0, $3) ORDER BY role",
+                &[&coll, id, &len],
+            )
+            .unwrap()
+        {
+            let samples: Vec<f64> = r.get(1);
+            got.entry(r.get(0)).or_default().extend(samples);
+        }
+    }
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let vib_ks: Vec<i64> = (0..4000).filter(|k| !(2400..2800).contains(k)).collect();
+    for (role, want) in [
+        (
+            "vib/accel_x",
+            vib_ks.iter().map(|&k| vib(0, k)).collect::<Vec<_>>(),
+        ),
+        ("vib/accel_y", vib_ks.iter().map(|&k| vib(1, k)).collect()),
+        ("thermal/temp", (0..100).map(temp).collect()),
+        ("hydraulic/pressure", (0..100).map(pressure).collect()),
+    ] {
+        assert_eq!(bits(&got[role]), bits(&want), "{role}");
+    }
 }
 
 #[test]
