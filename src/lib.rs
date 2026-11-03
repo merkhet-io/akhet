@@ -6,6 +6,7 @@ pub mod context;
 pub mod decode;
 pub mod event;
 pub mod faults;
+pub mod metrics;
 pub mod morlet;
 pub mod receiver;
 pub mod replay;

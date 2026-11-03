@@ -268,22 +268,8 @@ pub struct MqttSummary {
     pub unmatched_messages: u64,
 }
 
-#[derive(Default)]
-struct Counters {
-    received: AtomicU64,
-    committed: AtomicU64,
-    source_duplicates: AtomicU64,
-    transactions: AtomicU64,
-    max_batch: AtomicU64,
-    acks_enqueued: AtomicU64,
-    acks_skipped: AtomicU64,
-    saturation: AtomicU64,
-    dropped: AtomicU64,
-    connections: AtomicU64,
-    connection_errors: AtomicU64,
-    qos0: AtomicU64,
-    unmatched: AtomicU64,
-}
+// Shared with the metrics endpoint when one is configured.
+use crate::metrics::MqttCounters as Counters;
 
 impl Counters {
     fn summary(&self) -> MqttSummary {
@@ -423,6 +409,18 @@ fn to_event(cfg: &MqttConfig, r: &Received) -> (Event, Option<SourceClaim>) {
     let mut ev = Event::new(EventData::MqttMessage(msg), r.received_unix_ns);
     ev.source_identity = identity;
     (ev, claim)
+}
+
+/// Stable error-kind label for a connection error.
+fn connection_error_kind(e: &ConnectionError) -> &'static str {
+    match e {
+        ConnectionError::Io(_) => "io",
+        ConnectionError::Tls(_) => "tls",
+        ConnectionError::NetworkTimeout | ConnectionError::FlushTimeout => "timeout",
+        ConnectionError::ConnectionRefused(_) => "refused",
+        ConnectionError::MqttState(_) | ConnectionError::NotConnAck(_) => "protocol",
+        _ => "other",
+    }
 }
 
 /// What the spool records about the broker session's subscriptions, stored
@@ -695,7 +693,11 @@ pub async fn run(
     // Request channel: subscribe, PUBACKs, disconnect. PUBACKs are enqueued
     // with try_ack and retried, so a full channel never blocks the committer.
     let (client, eventloop) = AsyncClient::new(opts, cfg.queue_capacity.max(16) * 2);
-    let counters = Arc::new(Counters::default());
+    let metrics = spool.metrics().cloned();
+    let counters = metrics.as_ref().map(|m| m.mqtt.clone()).unwrap_or_default();
+    counters
+        .queue_capacity
+        .store(cfg.queue_capacity as u64, Ordering::Relaxed);
     let generation = Arc::new(Mutex::new(0u64));
     let fatal: Arc<Mutex<Option<CollectError>>> = Arc::new(Mutex::new(None));
     let stopping = Arc::new(AtomicBool::new(false));
@@ -732,6 +734,7 @@ pub async fn run(
         stopping,
         committer,
         acker,
+        metrics,
         subscriptions,
     )
     .await;
@@ -756,6 +759,7 @@ fn set_fatal(fatal: &Mutex<Option<CollectError>>, e: CollectError, stop: &Stop) 
 /// Notify readiness once the configured set is active; stop on errors.
 fn subscription_progress(
     cfg: &MqttConfig,
+    counters: &Counters,
     active: Result<bool, CollectError>,
     fatal: &Mutex<Option<CollectError>>,
     stop: &Stop,
@@ -763,6 +767,7 @@ fn subscription_progress(
     match active {
         Ok(true) => {
             log(format!("mqtt: subscription active for {:?}", cfg.topics));
+            counters.subscribed.store(true, Ordering::Relaxed);
             if let Some(r) = &cfg.ready {
                 r.notify_one();
             }
@@ -785,6 +790,7 @@ async fn poll_loop(
     stopping: Arc<AtomicBool>,
     committer: tokio::task::JoinHandle<()>,
     acker: tokio::task::JoinHandle<()>,
+    metrics: Option<Arc<crate::metrics::Metrics>>,
     mut subscriptions: Subscriptions,
 ) {
     let mut queue_tx = Some(queue_tx);
@@ -797,6 +803,8 @@ async fn poll_loop(
         // Transition into the shutdown phase exactly once.
         if drain_deadline.is_none() && stop.is_triggered() {
             stopping.store(true, Ordering::SeqCst);
+            // Not ready while draining.
+            counters.subscribed.store(false, Ordering::Relaxed);
             drain_deadline = Some(tokio::time::Instant::now() + cfg.shutdown_grace);
             // Closing the queue lets the committer finish its current
             // transaction and then drop (without acking) anything queued.
@@ -843,6 +851,9 @@ async fn poll_loop(
         match polled {
             Ok(MqEvent::Incoming(Packet::ConnAck(ack))) => {
                 counters.connections.fetch_add(1, Ordering::Relaxed);
+                counters.connected.store(true, Ordering::Relaxed);
+                // Set once the configured filter set is active.
+                counters.subscribed.store(false, Ordering::Relaxed);
                 backoff = cfg.reconnect_min;
                 log(format!(
                     "mqtt: connected to {}:{} as {:?} (session_present={})",
@@ -855,15 +866,15 @@ async fn poll_loop(
                 let active = subscriptions
                     .on_connack(cfg, &client, ack.session_present)
                     .await;
-                subscription_progress(cfg, active, &fatal, &stop);
+                subscription_progress(cfg, &counters, active, &fatal, &stop);
             }
             Ok(MqEvent::Incoming(Packet::SubAck(suback))) => {
                 let active = subscriptions.on_suback(cfg, &suback.return_codes).await;
-                subscription_progress(cfg, active, &fatal, &stop);
+                subscription_progress(cfg, &counters, active, &fatal, &stop);
             }
             Ok(MqEvent::Incoming(Packet::UnsubAck(_))) => {
                 let done = subscriptions.on_unsuback().await.map(|()| false);
-                subscription_progress(cfg, done, &fatal, &stop);
+                subscription_progress(cfg, &counters, done, &fatal, &stop);
             }
             Ok(MqEvent::Incoming(Packet::Publish(publish))) => {
                 counters.received.fetch_add(1, Ordering::Relaxed);
@@ -891,6 +902,9 @@ async fn poll_loop(
                     generation: gen_now,
                     received_unix_ns: event::now_unix_ns(),
                 };
+                // Counted before sending so the committer's decrement can
+                // never precede it.
+                counters.queue_depth.fetch_add(1, Ordering::Relaxed);
                 match tx.try_send(item) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(item)) => {
@@ -904,14 +918,17 @@ async fn poll_loop(
                         tokio::select! {
                             r = tx.send(item) => if r.is_err() {
                                 counters.dropped.fetch_add(1, Ordering::Relaxed);
+                                counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
                             },
                             _ = stop.wait() => {
                                 counters.dropped.fetch_add(1, Ordering::Relaxed);
+                                counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
                             }
                         }
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         counters.dropped.fetch_add(1, Ordering::Relaxed);
+                        counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -925,6 +942,11 @@ async fn poll_loop(
             Ok(_) => {}
             Err(e) => {
                 counters.connection_errors.fetch_add(1, Ordering::Relaxed);
+                counters.connected.store(false, Ordering::Relaxed);
+                counters.subscribed.store(false, Ordering::Relaxed);
+                if let Some(m) = &metrics {
+                    m.error("mqtt", connection_error_kind(&e));
+                }
                 {
                     // Invalidate acknowledgments for the lost connection and
                     // purge any PUBACK enqueued in the race window.
@@ -1006,6 +1028,9 @@ async fn committer(
                 }
             }
         }
+        counters
+            .queue_depth
+            .fetch_sub(batch.len() as u64, Ordering::Relaxed);
         for item in &batch {
             if item.publish.qos == QoS::AtMostOnce {
                 counters.qos0.fetch_add(1, Ordering::Relaxed);
@@ -1085,6 +1110,7 @@ async fn committer(
     rx.close();
     while let Ok(_unacked) = rx.try_recv() {
         counters.dropped.fetch_add(1, Ordering::Relaxed);
+        counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
     }
     let dropped = counters.dropped.load(Ordering::Relaxed);
     if dropped > 0 {

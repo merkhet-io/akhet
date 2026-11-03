@@ -82,6 +82,11 @@ impl TestReceiver {
         Self::start_with(db, "http", |r| r)
     }
 
+    /// Plain receiver bound to a chosen address (e.g. a port reserved first).
+    pub fn start_at(db: &Path, listen: &str) -> TestReceiver {
+        Self::start_full(db, listen, "http", |r| r)
+    }
+
     /// Receiver that does not advertise or serve the `batch-v1` extension.
     pub fn start_without_batch(db: &Path) -> TestReceiver {
         Self::start_with(db, "http", |r| r.without_batch())
@@ -93,8 +98,17 @@ impl TestReceiver {
         scheme: &str,
         f: impl FnOnce(Receiver) -> Receiver,
     ) -> TestReceiver {
+        Self::start_full(db, "127.0.0.1:0", scheme, f)
+    }
+
+    fn start_full(
+        db: &Path,
+        listen: &str,
+        scheme: &str,
+        f: impl FnOnce(Receiver) -> Receiver,
+    ) -> TestReceiver {
         let spool = Spool::open(db, MAX_DB).unwrap();
-        let r = f(Receiver::bind("127.0.0.1:0", spool, Faults::none()).unwrap());
+        let r = f(Receiver::bind(listen, spool, Faults::none()).unwrap());
         let url = format!("{scheme}://{}", r.local_addr().unwrap());
         let receiver_id = r.receiver_id().to_string();
         let stop = Arc::new(AtomicBool::new(false));

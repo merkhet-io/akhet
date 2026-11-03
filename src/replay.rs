@@ -60,10 +60,12 @@
 
 use crate::event;
 use crate::faults::{Faults, point};
+use crate::metrics::Metrics;
 use crate::spool::{PruneOptions, SinkRow, Spool, SpoolError, StoredRecord};
 use crate::tls;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -98,6 +100,8 @@ pub struct ReplayConfig {
     pub token: Option<Token>,
     /// Permit sending `token` over plain `http://`.
     pub allow_insecure_token: bool,
+    /// Report progress to a metrics endpoint.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 /// A bearer token. Its `Debug` output is redacted so it cannot leak through
@@ -153,6 +157,7 @@ impl ReplayConfig {
             client_cert: None,
             token: None,
             allow_insecure_token: false,
+            metrics: None,
         }
     }
 }
@@ -400,6 +405,37 @@ fn sleep_interruptible(d: Duration, stop: &AtomicBool) -> bool {
     !stop.load(Ordering::SeqCst)
 }
 
+/// Error-kind label for `akhet_errors_total{component="replay"}`.
+fn error_kind(e: &ReplayError) -> &'static str {
+    match e {
+        ReplayError::Unauthorized { .. } => "unauthorized",
+        ReplayError::Tls { .. } => "tls",
+        ReplayError::Rejected { .. } => "rejected",
+        ReplayError::Unavailable { .. } => "unavailable",
+        ReplayError::Protocol(_) => "protocol",
+        _ => "other",
+    }
+}
+
+/// Record a permanent failure that ends replay.
+fn note_failure(cfg: &ReplayConfig, e: &ReplayError) {
+    if let Some(m) = &cfg.metrics {
+        m.replay.last_attempt_failed.store(true, Ordering::Relaxed);
+        m.error("replay", error_kind(e));
+    }
+}
+
+/// Record records delivered up to `seq`.
+fn note_delivered(cfg: &ReplayConfig, seq: i64, delivered: u64, duplicates: u64) {
+    if let Some(m) = &cfg.metrics {
+        m.replay.checkpoint_seq.store(seq, Ordering::Relaxed);
+        m.replay.delivered.fetch_add(delivered, Ordering::Relaxed);
+        m.replay
+            .receiver_duplicates
+            .fetch_add(duplicates, Ordering::Relaxed);
+    }
+}
+
 /// Run `f` with bounded retries; Ok(None) means interrupted by stop.
 fn with_retries<T>(
     cfg: &ReplayConfig,
@@ -411,14 +447,31 @@ fn with_retries<T>(
     let mut attempts = 0;
     loop {
         attempts += 1;
-        match f() {
+        let r = f();
+        if let Some(m) = &cfg.metrics {
+            m.replay
+                .last_attempt_failed
+                .store(r.is_err(), Ordering::Relaxed);
+            match &r {
+                Err(Step::Retry(_)) => m.error("replay", "transient"),
+                Err(Step::Fail(e)) => m.error("replay", error_kind(e)),
+                Ok(_) => {}
+            }
+        }
+        match r {
             Ok(v) => return Ok(Some(v)),
             Err(Step::Fail(e)) => return Err(e),
             Err(Step::Retry(e)) if attempts >= cfg.max_attempts => {
+                if let Some(m) = &cfg.metrics {
+                    m.error("replay", "unavailable");
+                }
                 return Err(ReplayError::Unavailable { attempts, last: e });
             }
             Err(Step::Retry(e)) => {
                 *retries += 1;
+                if let Some(m) = &cfg.metrics {
+                    m.replay.retries.fetch_add(1, Ordering::Relaxed);
+                }
                 eprintln!(
                     "akhet: replay: transient failure ({e}); retry {attempts}/{} in {} ms",
                     cfg.max_attempts - 1,
@@ -609,6 +662,12 @@ pub fn run(
     let sink: SinkRow = spool.bind_sink(&cfg.sink, &url, &receiver_id)?;
     summary.receiver_id = receiver_id;
     summary.checkpoint_seq = sink.checkpoint_seq;
+    if let Some(m) = &cfg.metrics {
+        m.replay
+            .checkpoint_seq
+            .store(sink.checkpoint_seq, Ordering::Relaxed);
+        m.replay.bound.store(true, Ordering::Relaxed);
+    }
     if sink.checkpoint_seq == 0
         && let Some(first) = spool.read_after(0, 1)?.first()
         && first.seq > 1
@@ -729,14 +788,20 @@ pub fn run(
                         break 'outer;
                     }
                     Some(BatchAttempt::Results(r)) => r,
-                    Some(BatchAttempt::Protocol(e)) => return Err(ReplayError::Protocol(e)),
+                    Some(BatchAttempt::Protocol(e)) => {
+                        let e = ReplayError::Protocol(e);
+                        note_failure(cfg, &e);
+                        return Err(e);
+                    }
                     Some(BatchAttempt::Permanent { status, body }) => {
-                        return Err(ReplayError::Rejected {
+                        let e = ReplayError::Rejected {
                             seq: chunk[0].seq,
                             event_id: chunk[0].event_id.clone(),
                             status,
                             body,
-                        });
+                        };
+                        note_failure(cfg, &e);
+                        return Err(e);
                     }
                 };
                 summary.requests += 1;
@@ -750,22 +815,29 @@ pub fn run(
                     spool.advance_checkpoint(&sink, chunk[ok - 1].seq)?;
                     faults.hit(point::REPLAY_AFTER_CHECKPOINT);
                     summary.checkpoint_seq = chunk[ok - 1].seq;
+                    let dups = results[..ok].iter().filter(|r| r.status == 200).count() as u64;
                     summary.delivered += ok as u64;
-                    summary.receiver_duplicates +=
-                        results[..ok].iter().filter(|r| r.status == 200).count() as u64;
+                    summary.receiver_duplicates += dups;
+                    note_delivered(cfg, chunk[ok - 1].seq, ok as u64, dups);
                 }
                 if let Some(failed) = results.get(ok) {
                     if is_transient(failed.status) {
                         // Resend from the failed record (counted as a retry).
                         summary.retries += 1;
+                        if let Some(m) = &cfg.metrics {
+                            m.replay.retries.fetch_add(1, Ordering::Relaxed);
+                            m.error("replay", "transient");
+                        }
                         continue 'outer;
                     }
-                    return Err(ReplayError::Rejected {
+                    let e = ReplayError::Rejected {
                         seq: chunk[ok].seq,
                         event_id: chunk[ok].event_id.clone(),
                         status: failed.status,
                         body: failed.detail.clone(),
-                    });
+                    };
+                    note_failure(cfg, &e);
+                    return Err(e);
                 }
                 continue;
             }
@@ -799,14 +871,17 @@ pub fn run(
                     if duplicate {
                         summary.receiver_duplicates += 1;
                     }
+                    note_delivered(cfg, rec.seq, 1, u64::from(duplicate));
                 }
                 Some(Attempt::Permanent { status, body }) => {
-                    return Err(ReplayError::Rejected {
+                    let e = ReplayError::Rejected {
                         seq: rec.seq,
                         event_id: rec.event_id.clone(),
                         status,
                         body,
-                    });
+                    };
+                    note_failure(cfg, &e);
+                    return Err(e);
                 }
             }
         }

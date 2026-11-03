@@ -5,6 +5,7 @@ pub mod mqtt;
 
 use crate::event::Event;
 use crate::faults::Faults;
+use crate::metrics::Metrics;
 use crate::spool::{AppendOutcome, BatchItem, ItemErrors, SourceClaim, Spool, SpoolError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ use tokio::sync::watch;
 pub struct AsyncSpool {
     inner: Arc<Mutex<Spool>>,
     faults: Faults,
+    metrics: Option<Arc<Metrics>>,
     commit_log: Option<Arc<Mutex<Vec<CommitStat>>>>,
 }
 
@@ -35,6 +37,7 @@ impl AsyncSpool {
         AsyncSpool {
             inner: Arc::new(Mutex::new(spool)),
             faults,
+            metrics: None,
             commit_log: None,
         }
     }
@@ -46,6 +49,16 @@ impl AsyncSpool {
         self
     }
 
+    /// Report commit latency, spool errors and adapter counters to `metrics`.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn metrics(&self) -> Option<&Arc<Metrics>> {
+        self.metrics.as_ref()
+    }
+
     /// Durably append; resolves only after commit (or failure).
     pub async fn append(
         &self,
@@ -54,10 +67,16 @@ impl AsyncSpool {
     ) -> Result<AppendOutcome, SpoolError> {
         let inner = self.inner.clone();
         let faults = self.faults.clone();
+        let metrics = self.metrics.clone();
         tokio::task::spawn_blocking(move || {
+            let t0 = std::time::Instant::now();
             faults.delay_blocking(crate::faults::point::COLLECTOR_COMMIT);
             let mut s = inner.lock().unwrap_or_else(|p| p.into_inner());
-            s.append(&ev, claim.as_ref())
+            let r = s.append(&ev, claim.as_ref());
+            if let Some(m) = &metrics {
+                m.observe_append(t0.elapsed(), r.as_ref().err());
+            }
+            r
         })
         .await
         .map_err(|e| SpoolError::Io(std::io::Error::other(format!("spool task failed: {e}"))))?
@@ -74,6 +93,7 @@ impl AsyncSpool {
         let inner = self.inner.clone();
         let faults = self.faults.clone();
         let commit_log = self.commit_log.clone();
+        let metrics = self.metrics.clone();
         tokio::task::spawn_blocking(move || {
             use crate::faults::point;
             let bodies: Vec<Vec<u8>> = events.iter().map(|(ev, _)| ev.encode()).collect();
@@ -93,6 +113,15 @@ impl AsyncSpool {
                     faults.hit(point::COLLECTOR_BATCH_PARTIAL);
                 }
             });
+            if let Some(m) = &metrics {
+                // One observation per transaction (a group commit counts
+                // once); a failed transaction or a failed item is an error.
+                let err = match &res {
+                    Err(e) => Some(e),
+                    Ok(items) => items.iter().find_map(|r| r.as_ref().err()),
+                };
+                m.observe_append(t0.elapsed(), err);
+            }
             if let (Ok(_), Some(log)) = (&res, &commit_log) {
                 let finished = Instant::now();
                 log.lock()
