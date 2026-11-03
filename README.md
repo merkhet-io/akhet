@@ -307,8 +307,11 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
   value still in effect on an active recording is not written yet. Times map
   to the first sample at or after the change.
 - **Exactness:** derived state (grid state per channel, context timelines,
-  written context offsets) lives in `akhet_morlet_sinks` and is updated **in
-  the same transaction** as the samples, context rows and the sink's spool
+  written context offsets) lives in `akhet_morlet_sinks`. Each grid's
+  duplicate-detection window lives in `akhet_morlet_recent`, as binary blocks
+  of placed samples. Each transaction adds the new samples and drops blocks
+  that left the window, so `-0.0` and every other bit pattern survive a
+  restart. Both are updated **in the same transaction** as the samples, context rows and the sink's spool
   checkpoint. On any error or crash, the transaction rolls back and the sink
   resumes from the committed state. The local checkpoint is advanced after the
   commit and moved forward from the database if a crash came in between; a
@@ -347,8 +350,9 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
   creates the stream collection and its context tables.
 
 Limits: one sink transaction holds `--records-per-tx`
-records; the stored state grows with the number of channels and
-`dedup_window_samples`, and is rewritten on every transaction. Two sinks must
+records. The state row (about 1 KB per channel) is rewritten on every
+transaction; the duplicate-detection windows (`dedup_window_samples` per
+channel) are stored incrementally in `akhet_morlet_recent`. Two sinks must
 not write the same recordings. `--window-size`, `--stride`,
 `--normalization` and `--sample-quantum` are passed to MorletDB for new
 recordings.

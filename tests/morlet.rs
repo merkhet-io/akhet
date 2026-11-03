@@ -656,3 +656,114 @@ fn tls_modes_and_certificate_checks() {
     let (out, _) = run_with(&with(&base, "sslmode=prefer"));
     assert_eq!(out.status.code(), Some(2));
 }
+
+fn timing_issues(sink: &str) -> i64 {
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    db.query_one(
+        "SELECT count(*) FROM akhet_morlet_issues WHERE sink=$1 AND source='timing'",
+        &[&sink],
+    )
+    .unwrap()
+    .get(0)
+}
+
+/// The duplicate-detection windows live in `akhet_morlet_recent`, not in
+/// the state row, and survive restarts: the redelivered batch after a
+/// restart is skipped as a duplicate, not reported. A version 1 state (with
+/// the windows inside the row) is migrated on the next write.
+#[test]
+#[ignore = "needs AKHET_TEST_MORLET_URL"]
+fn dedup_windows_are_stored_incrementally_and_migrated() {
+    for migrate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("s.sqlite");
+        let want = build_spool(&spool);
+        let cfg = decoder_file(dir.path());
+        let coll = unique("akhet_w");
+        let sink = unique("s");
+        // Records: ctrl, b0, b1, b2, ctrl, b3 | b3 again, b4, ...
+        let out = morlet_run_args(&spool, &cfg, &sink, &coll, None, &["--limit", "6"]);
+        assert!(out.status.success());
+        let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+        let state: serde_json::Value = db
+            .query_one(
+                "SELECT state FROM akhet_morlet_sinks WHERE sink=$1",
+                &[&sink],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(state["version"], 2);
+        for g in state["grids"].as_object().unwrap().values() {
+            assert_eq!(g["recent"], serde_json::json!([]), "no window in the row");
+        }
+        let blocks = db
+            .query(
+                "SELECT channel, placed FROM akhet_morlet_recent WHERE sink=$1 ORDER BY channel, first_unix_ns",
+                &[&sink],
+            )
+            .unwrap();
+        assert!(!blocks.is_empty());
+        if migrate {
+            // Rewrite as a version 1 state: windows back into the row.
+            let mut st = state.clone();
+            for b in &blocks {
+                let ch: String = b.get(0);
+                let bytes: Vec<u8> = b.get(1);
+                let w = st["grids"][&ch]["recent"].as_array_mut().unwrap();
+                for e in bytes.chunks(16) {
+                    let t = i64::from_le_bytes(e[..8].try_into().unwrap());
+                    let v = f64::from_bits(u64::from_le_bytes(e[8..].try_into().unwrap()));
+                    w.push(serde_json::json!([t, v]));
+                }
+            }
+            st["version"] = 1.into();
+            db.execute(
+                "UPDATE akhet_morlet_sinks SET state=$2 WHERE sink=$1",
+                &[&sink, &st],
+            )
+            .unwrap();
+            db.execute("DELETE FROM akhet_morlet_recent WHERE sink=$1", &[&sink])
+                .unwrap();
+        }
+        let out = morlet_run(&spool, &cfg, &sink, &coll, None);
+        assert!(out.status.success(), "migrate={migrate}");
+        assert_exact(&coll, &want);
+        if migrate {
+            // A version 1 row is jsonb, which stores -0.0 as 0: the migrated
+            // window cannot tell them apart, so the redelivered -0.0 samples
+            // are reported as conflicts (samples are unaffected). Version 2
+            // stores the window in binary and keeps -0.0.
+            let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+            let other: i64 = db
+                .query_one(
+                    "SELECT count(*) FROM akhet_morlet_issues WHERE sink=$1 AND source='timing'
+                     AND detail->>'message' <> 'value -0 differs from 0 already placed at this timestamp'",
+                    &[&sink],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(other, 0);
+        } else {
+            assert_eq!(timing_issues(&sink), 0, "redelivery skipped as duplicate");
+        }
+        let v: i64 = db
+            .query_one(
+                "SELECT (state->>'version')::int8 FROM akhet_morlet_sinks WHERE sink=$1",
+                &[&sink],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(v, 2);
+        // Each placed sample is stored once (9 batches of 400 per channel,
+        // below the 8192-sample window, so nothing was dropped yet).
+        let row = db
+            .query_one(
+                "SELECT count(DISTINCT channel), max(n)::int8 FROM (SELECT channel, sum(length(placed))/16 AS n
+                 FROM akhet_morlet_recent WHERE sink=$1 GROUP BY channel) x",
+                &[&sink],
+            )
+            .unwrap();
+        let (chans, max_n): (i64, i64) = (row.get(0), row.get(1));
+        assert_eq!((chans, max_n), (2, 9 * N as i64));
+    }
+}
