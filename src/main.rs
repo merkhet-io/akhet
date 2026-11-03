@@ -142,6 +142,25 @@ enum Command {
     },
     /// Verify SQLite structure and every record checksum and format version.
     Verify,
+    /// Decode spooled MQTT payloads into per-channel sample batches (read-only).
+    ///
+    /// Prints one JSON line per MQTT record with its channel batches and any
+    /// explicit decode issues, then a summary line. The spool is not modified.
+    Decode {
+        /// Decoder config file (JSON, see examples/decoder.json).
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Include timestamp and value arrays (default: counts and ranges).
+        #[arg(long)]
+        samples: bool,
+        /// Print only the summary line.
+        #[arg(long, conflicts_with = "samples")]
+        summary_only: bool,
+    },
     /// Run the example HTTP receiver (stores into its own spool file).
     Receive {
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -379,6 +398,29 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(spool_exit(&e), e),
         },
+        Command::Decode {
+            config,
+            after,
+            limit,
+            samples,
+            summary_only,
+        } => {
+            let cfg = match akhet::decode::DecoderConfig::load(&config) {
+                Ok(c) => c,
+                Err(e) => return fail(2, e),
+            };
+            let spool = match open() {
+                Ok(s) => s,
+                Err(e) => return fail(spool_exit(&e), e),
+            };
+            match decode_spool(&spool, &cfg, after, limit, samples, summary_only) {
+                Ok(summary) => {
+                    print_json(&summary);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(spool_exit(&e), e),
+            }
+        }
         Command::Receive { listen, db } => {
             let spool = match Spool::open_with_limits(&db, cli.max_db_bytes, cli.max_event_bytes) {
                 Ok(s) => s,
@@ -403,6 +445,88 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+#[derive(Default, serde::Serialize)]
+struct DecodeSummary {
+    summary: bool,
+    records: u64,
+    mqtt_records: u64,
+    records_with_issues: u64,
+    channel_batches: u64,
+    samples: u64,
+    issues_by_kind: std::collections::BTreeMap<String, u64>,
+    last_seq: i64,
+}
+
+fn decode_spool(
+    spool: &Spool,
+    cfg: &akhet::decode::DecoderConfig,
+    mut after: i64,
+    limit: Option<usize>,
+    samples: bool,
+    summary_only: bool,
+) -> Result<DecodeSummary, SpoolError> {
+    let mut sum = DecodeSummary {
+        summary: true,
+        last_seq: after,
+        ..Default::default()
+    };
+    let mut left = limit.unwrap_or(usize::MAX);
+    while left > 0 {
+        let batch = spool.read_after(after, left.min(256))?;
+        let Some(last) = batch.last() else { break };
+        after = last.seq;
+        left -= batch.len();
+        for r in batch {
+            sum.records += 1;
+            sum.last_seq = r.seq;
+            let ev = akhet::event::decode(&r.body)?;
+            let Some(d) = cfg.decode_event(&ev) else {
+                continue;
+            };
+            sum.mqtt_records += 1;
+            if !d.issues.is_empty() {
+                sum.records_with_issues += 1;
+            }
+            for i in &d.issues {
+                let k = serde_json::to_value(&i.kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                *sum.issues_by_kind.entry(k).or_default() += 1;
+            }
+            sum.channel_batches += d.batches.len() as u64;
+            sum.samples += d.batches.iter().map(|b| b.values.len() as u64).sum::<u64>();
+            if summary_only {
+                continue;
+            }
+            let batches: Vec<serde_json::Value> = d
+                .batches
+                .iter()
+                .map(|b| {
+                    if samples {
+                        serde_json::to_value(b).unwrap_or_default()
+                    } else {
+                        serde_json::json!({
+                            "channel": b.channel,
+                            "unit": b.unit,
+                            "samples": b.values.len(),
+                            "first_unix_ns": b.timestamps_unix_ns.first(),
+                            "last_unix_ns": b.timestamps_unix_ns.last(),
+                        })
+                    }
+                })
+                .collect();
+            print_json(&serde_json::json!({
+                "seq": r.seq,
+                "event_id": r.event_id,
+                "batches": batches,
+                "issues": d.issues,
+            }));
+        }
+    }
+    Ok(sum)
 }
 
 fn collect_fail(e: CollectError) -> ExitCode {
