@@ -82,6 +82,11 @@ impl TestReceiver {
         Self::start_with(db, "http", |r| r)
     }
 
+    /// Receiver that does not advertise or serve the `batch-v1` extension.
+    pub fn start_without_batch(db: &Path) -> TestReceiver {
+        Self::start_with(db, "http", |r| r.without_batch())
+    }
+
     /// Receiver configured by `f` (TLS, token), addressed as `scheme://127.0.0.1:port`.
     pub fn start_with(
         db: &Path,

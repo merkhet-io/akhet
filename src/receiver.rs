@@ -6,6 +6,11 @@
 //! success status is returned. Identical re-sends of an event_id return 200;
 //! a different body for an existing event_id returns 409.
 //!
+//! It also implements the optional batch extension (`batch-v1`, see
+//! `replay.rs`): `POST /v1/events/batch` stores up to
+//! [`BATCH_MAX_RECORDS`] events in ONE transaction and answers with a
+//! per-record status array after that commit.
+//!
 //! Optional security: TLS (rustls), mutual TLS (client certificates must chain
 //! to a configured CA) and a bearer token (`Authorization: Bearer <token>`,
 //! compared in constant time; missing or wrong tokens get 401 on every path).
@@ -22,7 +27,8 @@
 
 use crate::event::{self, FormatError};
 use crate::faults::{Faults, point};
-use crate::spool::{AppendOutcome, Spool, SpoolError};
+use crate::replay::BATCH_FEATURE;
+use crate::spool::{AppendOutcome, BatchItem, ItemErrors, Spool, SpoolError};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -34,6 +40,12 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Request line plus headers.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
+/// Most records accepted in one batch request.
+pub const BATCH_MAX_RECORDS: usize = 1000;
+/// Largest accepted batch request body.
+pub const BATCH_MAX_BYTES: usize = 32 << 20;
+/// Longest record header line in a batch body (without the newline).
+const BATCH_MAX_HEADER: usize = 256;
 
 pub struct Receiver {
     listener: TcpListener,
@@ -42,6 +54,10 @@ pub struct Receiver {
     tls: Option<Arc<rustls::ServerConfig>>,
     /// SHA-256 of the expected bearer token.
     token_sha256: Option<[u8; 32]>,
+    /// Advertise and serve the `batch-v1` extension.
+    batch: bool,
+    /// Set when the current batch request committed at least one new event.
+    committed_new: bool,
 }
 
 struct Head {
@@ -270,7 +286,17 @@ impl Receiver {
             faults,
             tls: None,
             token_sha256: None,
+            batch: true,
+            committed_new: false,
         })
+    }
+
+    /// Behave like a receiver without the `batch-v1` extension (tests of the
+    /// client fallback).
+    #[doc(hidden)]
+    pub fn without_batch(mut self) -> Self {
+        self.batch = false;
+        self
     }
 
     /// Serve HTTPS with this configuration (see [`crate::tls::server_config`]).
@@ -365,7 +391,7 @@ impl Receiver {
             Err(Bad::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(Bad::Io(e)) => return Err(e),
         };
-        if status == 201 {
+        if status == 201 || std::mem::take(&mut self.committed_new) {
             self.faults.hit(point::RECEIVER_AFTER_COMMIT);
         }
         write_response(s, status, &body)
@@ -392,6 +418,16 @@ impl Receiver {
             return Err(Bad::Status(401, "missing or invalid bearer token".into()));
         }
         match (head.method.as_str(), head.path.as_str()) {
+            ("GET", "/v1/identity") if self.batch => Ok((
+                200,
+                serde_json::json!({
+                    "receiver_id": self.spool.spool_id(),
+                    "protocol": "akhet-replay-v1",
+                    "features": [BATCH_FEATURE],
+                    "batch_max_records": BATCH_MAX_RECORDS,
+                    "batch_max_bytes": BATCH_MAX_BYTES,
+                }),
+            )),
             ("GET", "/v1/identity") => Ok((
                 200,
                 serde_json::json!({"receiver_id": self.spool.spool_id(), "protocol": "akhet-replay-v1"}),
@@ -400,48 +436,191 @@ impl Receiver {
                 let body = read_body(s, &head, self.spool.max_event_bytes())?;
                 Ok(self.post_event(&head, &body))
             }
+            ("POST", "/v1/events/batch") if self.batch => {
+                let body = read_body(s, &head, BATCH_MAX_BYTES)?;
+                let (status, v, stored) = self.post_batch(&body);
+                self.committed_new = stored;
+                Ok((status, v))
+            }
             _ => Err(Bad::Status(404, "not found".into())),
         }
     }
 
     fn post_event(&mut self, head: &Head, body: &[u8]) -> (u16, serde_json::Value) {
-        let err = |s: u16, m: String| (s, serde_json::json!({"error": m}));
-        let event_id = match event::check_body(body) {
-            Ok(id) => id,
-            Err(FormatError::UnsupportedVersion(v)) => {
-                return err(422, format!("unsupported event format_version {v}"));
-            }
-            Err(e) => return err(400, e.to_string()),
-        };
-        if head.header("Idempotency-Key") != Some(event_id.as_str()) {
-            return err(
-                400,
-                "Idempotency-Key header must equal the body event_id".into(),
-            );
+        if let Err((status, m)) = validate(
+            body,
+            self.spool.max_event_bytes(),
+            head.header("Idempotency-Key"),
+            head.header("Akhet-Body-SHA256"),
+            ("Idempotency-Key header", "Akhet-Body-SHA256"),
+        ) {
+            return (status, serde_json::json!({"error": m}));
         }
-        if let Some(sha) = head.header("Akhet-Body-SHA256")
-            && !sha.eq_ignore_ascii_case(&event::sha256_hex(body))
-        {
-            return err(
-                400,
-                "Akhet-Body-SHA256 does not match the received body".into(),
-            );
-        }
-        match self.spool.append_body(body, None) {
-            Ok(AppendOutcome::Inserted { seq }) => {
-                (201, serde_json::json!({"status": "stored", "seq": seq}))
-            }
-            Ok(o) => (
-                200,
-                serde_json::json!({"status": "duplicate", "seq": o.seq()}),
-            ),
-            Err(e @ SpoolError::Conflict { .. }) => err(409, e.to_string()),
-            Err(e @ SpoolError::EventTooLarge { .. }) => err(413, e.to_string()),
-            Err(e @ SpoolError::Format(_)) => err(422, e.to_string()),
-            Err(e) if e.is_capacity() => err(507, e.to_string()),
-            Err(e) => err(500, e.to_string()),
-        }
+        append_response(self.spool.append_body(body, None))
     }
+
+    /// Batch extension: parse the framed records, validate each one, store
+    /// the valid ones in one transaction, then report per-record statuses.
+    /// The bool is true when at least one new event was committed.
+    fn post_batch(&mut self, body: &[u8]) -> (u16, serde_json::Value, bool) {
+        let err = |s: u16, m: String| (s, serde_json::json!({"error": m}), false);
+        let frames = match parse_batch(body) {
+            Ok(f) => f,
+            Err((status, m)) => return err(status, m),
+        };
+        let max = self.spool.max_event_bytes();
+        // Per-record pre-checks; only valid records go into the transaction.
+        let checks: Vec<Result<(), (u16, String)>> = frames
+            .iter()
+            .map(|f| {
+                validate(
+                    &body[f.body.clone()],
+                    max,
+                    Some(f.event_id),
+                    Some(f.sha256),
+                    ("record event_id", "record SHA-256"),
+                )
+            })
+            .collect();
+        let items: Vec<BatchItem<'_>> = frames
+            .iter()
+            .zip(&checks)
+            .filter(|(_, c)| c.is_ok())
+            .map(|(f, _)| BatchItem {
+                body: &body[f.body.clone()],
+                source: None,
+            })
+            .collect();
+        let mut stored = match self.spool.append_batch(&items, ItemErrors::Independent) {
+            Ok(r) => r.into_iter(),
+            // Whole transaction failed: nothing stored, retryable.
+            Err(e) => {
+                let (status, v) = append_response(Err(e));
+                return (status, v, false);
+            }
+        };
+        let mut any_new = false;
+        let results: Vec<serde_json::Value> = frames
+            .iter()
+            .zip(checks)
+            .map(|(f, check)| {
+                let (status, mut v) = match check {
+                    Err((status, m)) => (status, serde_json::json!({"error": m})),
+                    Ok(()) => append_response(stored.next().expect("one result per valid item")),
+                };
+                any_new |= status == 201;
+                v["event_id"] = f.event_id.into();
+                v["status_code"] = status.into();
+                v
+            })
+            .collect();
+        (200, serde_json::json!({"results": results}), any_new)
+    }
+}
+
+/// Checks shared by single and batch posts: size, format, claimed event_id
+/// and (when given) the claimed SHA-256 of the body.
+fn validate(
+    body: &[u8],
+    max: usize,
+    claimed_id: Option<&str>,
+    claimed_sha: Option<&str>,
+    (id_source, sha_source): (&str, &str),
+) -> Result<(), (u16, String)> {
+    if body.len() > max {
+        return Err((413, format!("body exceeds {max} bytes")));
+    }
+    let event_id = match event::check_body(body) {
+        Ok(id) => id,
+        Err(FormatError::UnsupportedVersion(v)) => {
+            return Err((422, format!("unsupported event format_version {v}")));
+        }
+        Err(e) => return Err((400, e.to_string())),
+    };
+    if claimed_id != Some(event_id.as_str()) {
+        return Err((400, format!("{id_source} must equal the body event_id")));
+    }
+    if let Some(sha) = claimed_sha
+        && !sha.eq_ignore_ascii_case(&event::sha256_hex(body))
+    {
+        return Err((
+            400,
+            format!("{sha_source} does not match the received body"),
+        ));
+    }
+    Ok(())
+}
+
+/// HTTP status and JSON body for one append result.
+fn append_response(r: Result<AppendOutcome, SpoolError>) -> (u16, serde_json::Value) {
+    let err = |s: u16, m: String| (s, serde_json::json!({"error": m}));
+    match r {
+        Ok(AppendOutcome::Inserted { seq }) => {
+            (201, serde_json::json!({"status": "stored", "seq": seq}))
+        }
+        Ok(o) => (
+            200,
+            serde_json::json!({"status": "duplicate", "seq": o.seq()}),
+        ),
+        Err(e @ SpoolError::Conflict { .. }) => err(409, e.to_string()),
+        Err(e @ SpoolError::EventTooLarge { .. }) => err(413, e.to_string()),
+        Err(e @ SpoolError::Format(_)) => err(422, e.to_string()),
+        Err(e) if e.is_capacity() => err(507, e.to_string()),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+struct Frame<'a> {
+    event_id: &'a str,
+    sha256: &'a str,
+    body: std::ops::Range<usize>,
+}
+
+/// Parse a `batch-v1` body: records of `<event_id> <sha256-hex> <length>\n`
+/// followed by `<length>` body bytes and `\n`. Framing errors reject the
+/// whole request (400); too many records is 413.
+fn parse_batch(body: &[u8]) -> Result<Vec<Frame<'_>>, (u16, String)> {
+    let bad = |m: &str| Err((400, format!("malformed batch body: {m}")));
+    let mut frames = Vec::new();
+    let mut pos = 0;
+    while pos < body.len() {
+        if frames.len() == BATCH_MAX_RECORDS {
+            return Err((413, format!("more than {BATCH_MAX_RECORDS} records")));
+        }
+        let rest = &body[pos..];
+        let Some(nl) = rest
+            .iter()
+            .take(BATCH_MAX_HEADER + 1)
+            .position(|b| *b == b'\n')
+        else {
+            return bad("record header line missing or too long");
+        };
+        let Ok(line) = std::str::from_utf8(&rest[..nl]) else {
+            return bad("record header is not UTF-8");
+        };
+        let parts: Vec<&str> = line.split(' ').collect();
+        let [event_id, sha256, len] = parts.as_slice() else {
+            return bad("record header must be `<event_id> <sha256> <length>`");
+        };
+        let Ok(len) = len.parse::<usize>() else {
+            return bad("record length is not a number");
+        };
+        let start = pos + nl + 1;
+        let end = match start.checked_add(len) {
+            Some(end) if end < body.len() && body[end] == b'\n' => end,
+            _ => return bad("record body truncated or not followed by a newline"),
+        };
+        frames.push(Frame {
+            event_id,
+            sha256,
+            body: start..end,
+        });
+        pos = end + 1;
+    }
+    if frames.is_empty() {
+        return bad("no records");
+    }
+    Ok(frames)
 }
 
 #[cfg(test)]
@@ -482,5 +661,29 @@ mod tests {
         assert!(digest_eq(&a, &sha256(b"secret")));
         assert!(!digest_eq(&a, &sha256(b"secreT")));
         assert!(!digest_eq(&a, &sha256(b"")));
+    }
+
+    #[test]
+    fn batch_framing() {
+        let body = b"a 00 3\n{x}\nb 11 0\n\n";
+        let f = parse_batch(body).unwrap();
+        assert_eq!(f.len(), 2);
+        assert_eq!((f[0].event_id, f[0].sha256), ("a", "00"));
+        assert_eq!(&body[f[0].body.clone()], b"{x}");
+        assert!(f[1].body.is_empty());
+        for bad in [
+            &b""[..],
+            b"a 00 3\n{x}",         // missing trailing newline
+            b"a 00 4\n{x}\n",       // length past the end
+            b"a 00\n{x}\n",         // missing length
+            b"a 00 x\n{x}\n",       // non-numeric length
+            b"a 00 3 extra\n{x}\n", // extra field
+        ] {
+            assert_eq!(parse_batch(bad).err().map(|e| e.0), Some(400), "{bad:?}");
+        }
+        let long = format!("{} 00 0\n\n", "x".repeat(300));
+        assert!(parse_batch(long.as_bytes()).is_err());
+        let many = "a 00 0\n\n".repeat(BATCH_MAX_RECORDS + 1);
+        assert_eq!(parse_batch(many.as_bytes()).err().map(|e| e.0), Some(413));
     }
 }

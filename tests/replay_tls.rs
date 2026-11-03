@@ -187,6 +187,28 @@ fn replay_over_tls_with_trusted_custom_ca_and_token() {
 }
 
 #[test]
+fn batched_replay_over_tls_with_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pki(dir.path(), &["127.0.0.1"]);
+    let db = dir.path().join("spool.sqlite");
+    seed(&db, 25);
+    let rx = tls_receiver(dir.path(), &p, Some(TOKEN));
+    let out = replay(
+        &db,
+        &rx.url,
+        Some(TOKEN),
+        &["--ca-file", path(&p.ca_file), "--records-per-request", "10"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let s = stdout_json(&out);
+    assert_eq!(s["batch_protocol"], true, "{s}");
+    assert_eq!(s["delivered"], 25);
+    assert_eq!(s["requests"], 3, "batches of 10, 10 and 5");
+    assert_eq!(bodies(&rx.db), bodies(&db));
+    assert_eq!(checkpoint(&db, "s"), 25);
+}
+
+#[test]
 fn untrusted_ca_fails_permanently_without_retries() {
     let dir = tempfile::tempdir().unwrap();
     let p = pki(dir.path(), &["127.0.0.1"]);

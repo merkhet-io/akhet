@@ -52,7 +52,15 @@ pub struct MqttMessage {
     /// Broker address as configured (`host:port`).
     pub broker: String,
     pub client_id: String,
+    /// First configured topic filter (in configuration order) that matches
+    /// `topic`; empty when none does (e.g. a message queued by the broker for
+    /// a filter that was removed from the configuration).
     pub subscription: String,
+    /// Every configured topic filter that matches `topic`, in configuration
+    /// order. Added within format version 1: absent in older records, where
+    /// `subscription` was the single configured filter.
+    #[serde(default)]
+    pub subscriptions: Vec<String>,
     pub topic: String,
     pub qos: u8,
     pub retain: bool,
@@ -212,6 +220,18 @@ mod tests {
             check_body(&serde_json::to_vec(&v2).unwrap()),
             Err(FormatError::UnsupportedVersion(2))
         );
+    }
+
+    #[test]
+    fn mqtt_record_without_subscriptions_still_decodes() {
+        // Format-version-1 MQTT body written before `subscriptions` existed.
+        let old = br#"{"format_version":1,"event_id":"e1","collected_unix_ns":1,"kind":"mqtt_message","broker":"h:1883","client_id":"c","subscription":"plant/#","topic":"plant/a","qos":1,"retain":false,"dup":false,"payload_base64":"","payload_len":0}"#;
+        let e = decode(old).unwrap();
+        let EventData::MqttMessage(m) = e.data else {
+            panic!("not an MQTT event")
+        };
+        assert_eq!(m.subscription, "plant/#");
+        assert!(m.subscriptions.is_empty());
     }
 
     #[test]
