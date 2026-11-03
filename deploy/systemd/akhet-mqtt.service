@@ -1,0 +1,69 @@
+# Akhet MQTT collector. Install to /etc/systemd/system/ (see docs/deployment.md).
+#
+# Single writer: run exactly one collector per spool file. For Modbus, copy this
+# unit (e.g. akhet-modbus.service) with its own AKHET_SPOOL and an
+# `akhet modbus ...` ExecStart; do not share one spool between two collectors.
+[Unit]
+Description=Akhet MQTT collector (durable local spool)
+Documentation=https://github.com/merkhet-io/akhet/blob/main/docs/deployment.md
+Wants=network-online.target
+After=network-online.target
+# Give up after 5 failed starts in 10 minutes instead of looping forever.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=akhet
+Group=akhet
+EnvironmentFile=/etc/akhet/akhet.env
+EnvironmentFile=/etc/akhet/mqtt-credentials.env
+# Creates /var/lib/akhet (mode 0700, owned by akhet) and keeps it across restarts.
+StateDirectory=akhet
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/local/bin/akhet --max-db-bytes ${AKHET_MAX_DB_BYTES} mqtt \
+    --host ${AKHET_MQTT_HOST} --port ${AKHET_MQTT_PORT} \
+    --topic ${AKHET_MQTT_TOPIC} --client-id ${AKHET_MQTT_CLIENT_ID}
+
+# Exit codes (README): network/TLS errors are retried inside the process, so
+# an exit is not a transient blip. Restart on unexpected failures (1), but not
+# on configuration (2), integrity (3) or capacity (4) errors: restarting cannot
+# fix those and would only hide them. Investigate with `journalctl -u`.
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=2 3 4
+# SIGTERM: finish the in-progress commit, flush PUBACKs, DISCONNECT (10 s grace).
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# Hardening. The process needs: outbound TCP, its state directory, CA certs.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

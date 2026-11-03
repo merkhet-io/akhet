@@ -21,6 +21,17 @@ alias akhet=./target/release/akhet   # or use `cargo run --release --` below
 akhet --help
 ```
 
+## Deployment
+
+Tagged releases (`v*`) publish static Linux binaries for x86_64 and aarch64
+with `SHA256SUMS` and GitHub build-provenance attestations, plus a multi-arch
+container image (`ghcr.io/merkhet-io/akhet`, distroless, non-root, `/data`
+volume). `deploy/` has hardened systemd units and a single-replica Kubernetes
+StatefulSet. [docs/deployment.md](docs/deployment.md) covers installation,
+verification, the one-collector-per-spool rule and the upgrade path for an
+existing spool (today a build refuses a spool with a different schema version
+rather than migrating it).
+
 ## Local example without hardware
 
 Development-only peers ship as Cargo examples: an embedded MQTT broker
@@ -118,6 +129,173 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
 (raw uint16) or `status: "read_failed"` with `error_kind`
 (`connect`|`timeout`|`transport`|`exception`|`response_length`|`resolve`) and
 `message`. Failed reads never carry register values.
+
+### Payload decoding (read-only)
+
+`akhet decode --config <file>` maps spooled MQTT payloads to per-channel
+sample batches. It reads the spool and never modifies it: the raw payload bytes
+stay stored exactly as received, and a corrected decoder config can be re-run
+over the same records.
+
+```sh
+akhet --spool data/s.sqlite decode --config examples/decoder.json            # counts and ranges
+akhet --spool data/s.sqlite decode --config examples/decoder.json --samples  # full arrays
+akhet --spool data/s.sqlite decode --config examples/decoder.json --summary-only
+```
+
+Supported shape: one message holds one or more *signal groups*; each group has
+one timestamp array and one value array per signal, all of equal length. The
+config (JSON, `format_version: 1`, see `examples/decoder.json`) has one rule
+per topic filter; the first matching rule applies:
+
+| Field | Meaning |
+|---|---|
+| `topic` | MQTT filter (`+`, `#`) |
+| `source` | Source template: `{topic}`, `{topic.N}` (zero-based level), `{/json/pointer}` into the message |
+| `groups` | Optional JSON pointer to the array of groups; absent = the message is one group |
+| `group` | Group name template; additionally `{group:/pointer}` into the group |
+| `timestamps`, `timestamp_unit` | Pointer to the integer timestamp array; `ns`, `us`, `ms` or `s` since the Unix epoch |
+| `signals` | `{"map": "/pointer"}` (object of name → array) or `{"list": [{"name", "pointer"}]}` |
+| `units`, `default_unit` | Unit per signal name; a signal without a unit is an issue, never unlabelled |
+| `metadata` | Static JSON object attached to every channel |
+
+A channel is identified by `(source, group, signal)`. Validation per group:
+integer timestamps, strictly increasing within the group, equal array lengths,
+finite numeric values, a configured unit, and no channel twice in one message.
+Every failure is an explicit issue with its kind (`no_matching_rule`,
+`not_json`, `bad_structure`, `bad_template`, `bad_timestamp`,
+`non_monotonic_timestamps`, `length_mismatch`, `non_finite_value`, `no_unit`,
+`too_large`, `duplicate_channel`), rule, topic, group index, signal and sample
+index. A group with an issue yields no batches, so a group is never partly
+decoded; other groups of the same message still decode. Values are parsed as
+IEEE 754 float64 from the JSON text and are bit-exact for numbers that
+round-trip through float64.
+
+Decoding does not interpret timing: it reports the publisher's timestamps
+as given. Converting timestamps to a uniform sample grid is a separate step.
+
+### Sample grid placement (read-only)
+
+`akhet grid --config <file> [--chunks [--samples]]` places decoded samples of
+each channel on a uniform grid (sample rate, anchor timestamp, integer sample
+offsets), the form a uniformly sampled store needs. Dropping per-sample
+timestamps is only honest when they lie on a regular grid, so placement is
+strict:
+
+- A sample within the tolerance of the next grid position is placed there.
+- A sample within tolerance of a *later* grid position ends the recording
+  (`gap`, with the number of missing grid positions); one off the grid ends it
+  as `off_grid` or, when the re-estimated rate differs, `rate_change`. The next
+  recording starts at that sample and records the discontinuity (reason,
+  previous recording, its last timestamp, gap length). Missing values are
+  never invented.
+- A timestamp at or before the latest one is never reordered: an exact repeat
+  (same timestamp and value bits, within the last `dedup_window_samples`) is
+  skipped as a duplicate, which absorbs redelivered batches; a different value
+  is a `conflict` issue; anything else is an `out_of_order` issue.
+- Samples are never interpolated, resampled or moved by more than the
+  tolerance. The reconstructed timestamp of sample `k` is
+  `anchor_unix_ns + round(k * 1e9 / rate_hz)`.
+
+Per rule, `timing` sets `rate_hz` (absent: estimated per recording from the
+median spacing of its first `estimate_samples` samples, rounded to
+`rate_resolution_hz`), `tolerance_ns` or `tolerance_fraction` of a period
+(default 0.1), `dedup_window_samples` (8192) and `max_chunk_samples` (32768).
+
+Recording keys are deterministic: `<source>/<group>/<signal>@<anchor_unix_ns>`
+(parts percent-encoded). Each chunk carries timing evidence: the original
+timestamps of its first and last sample and the maximum and RMS deviation from
+the grid. The summary reports per channel: samples in and placed, duplicates,
+conflicts, out-of-order and unplaced samples, recordings, splits by reason,
+missing samples in gaps, maximum and RMS reconstruction error, and
+`samples_beyond_tolerance` (zero by construction, reported as a check).
+
+The grid state of a channel is serializable so a replay sink can persist it
+atomically with its checkpoint. Clock drift of the source is not corrected; it
+shows up as growing deviation and, beyond the tolerance, as splits.
+### Context timelines (read-only)
+
+Controller signals such as program number, tool, part count or feed override
+change irregularly and are not waveforms. List them in a rule's
+`context_signals`; their values may be numbers, strings (up to 1024 bytes) or
+booleans and need no unit (`bad_context_value` otherwise).
+
+`akhet context --config <file>` turns their observations into change events
+with last-value-held semantics, printed as JSON lines with a summary per
+channel:
+
+- Repeated observations of the value in effect produce no event.
+- A newer observation with a different value is a change event with the
+  publisher timestamp (`clock: "source"`), the collector timestamp of the
+  message (`collected_unix_ns`) and the previous value.
+- A late or out-of-order observation never rewrites the timeline: if it agrees
+  with the value in effect at its time it is counted as `late_consistent`
+  (this absorbs redelivered messages); otherwise it is a `late_conflict` issue,
+  or `late_unknown` when it predates the retained history (4096 changes per
+  channel).
+
+The timeline is a deterministic function of the spooled records in order, so
+it can be rebuilt exactly from the spool. Values compare as JSON values (`1`
+and `1.0` differ).
+
+### MorletDB sink
+
+`akhet morlet` replays the spool into PostgreSQL with the `pg_morlet`
+extension. Per record: `decode` → `grid` per waveform channel → recordings and
+chunks in a MorletDB stream collection; `context_signals` → interval rows in
+the collection's context timeline.
+
+```sh
+export AKHET_MORLET_URL='postgresql://user:password@db.example:5432/morlet'   # never on argv
+akhet --spool data/s.sqlite morlet --sink central --collection signals \
+  --config decoder.json --create-collection --follow
+```
+
+- **Recordings:** one per grid recording, created with
+  `morlet_ensure_recording(rate, channel = "<source>/<group>/<signal>", unit,
+  metadata)`. Metadata holds the rule's static metadata plus an `akhet`
+  object: source, group, signal, anchor timestamp, whether the rate was
+  estimated, the tolerance and the discontinuity that started it. Chunks go
+  through `morlet_append_chunk` at the grid's sample offsets; values are sent
+  as binary float64 and read back bit-exactly.
+- **Timing evidence:** per chunk in `akhet_morlet_evidence` (first/last
+  original timestamp, max/RMS deviation, spool seq).
+- **Explicit issues:** decode, timing and context issues go to
+  `akhet_morlet_issues` (sink, spool seq, kind and details).
+- **Context:** for each context key of a source, the value in effect becomes
+  an interval `[start_sample, end_sample)` on every recording of the same
+  source it overlaps (key = signal name). An interval is written once its end
+  is known: at the next change, or clipped at the end of a recording. The
+  value still in effect on an active recording is not written yet. Times map
+  to the first sample at or after the change.
+- **Exactness:** derived state (grid state per channel, context timelines,
+  written context offsets) lives in `akhet_morlet_sinks` and is updated **in
+  the same transaction** as the samples, context rows and the sink's spool
+  checkpoint. On any error or crash, the transaction rolls back and the sink
+  resumes from the committed state. The local checkpoint is advanced after the
+  commit and moved forward from the database if a crash came in between; a
+  database checkpoint *behind* the local one (restored database) is refused.
+  Crash tests at the existing replay fault points show no lost or duplicated
+  samples.
+- **Binding:** the database gets a random `database_id` (table
+  `akhet_morlet_identity`), used like a receiver identity; a sink name is
+  bound to one spool, one collection and one database. Re-using it elsewhere
+  is refused (exit 3).
+- **Errors:** connection-class failures are retried with bounded backoff
+  (exit 6 when exhausted). Anything MorletDB rejects (conflicting samples at
+  an existing offset, overlapping context, a rate or chunk it refuses) is
+  permanent (exit 5), with the database message.
+- **Privileges:** the role needs to create the `akhet_morlet_*` tables in its
+  schema (once) and use the collection; `--create-collection` additionally
+  creates the stream collection and its context tables.
+
+Limits: the connection has no TLS yet (use a local socket, a VPN or a
+TLS-terminating proxy). One sink transaction holds `--records-per-tx`
+records; the stored state grows with the number of channels and
+`dedup_window_samples`, and is rewritten on every transaction. Two sinks must
+not write the same recordings. Feature extraction defaults to `none` (raw
+storage only); `--extractor`, `--window-size`, `--stride`, `--normalization`
+and `--sample-quantum` are passed to MorletDB for new recordings.
 
 ## Delivery semantics
 
@@ -300,6 +478,9 @@ Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
 | 6 | Receiver unavailable after bounded retries |
 | 7 | Another replayer holds this sink |
 
+`akhet morlet` uses the same codes: 3 for sink binding mismatches, 5 for writes
+MorletDB rejects, 6 when the database stays unreachable, 2 for configuration.
+
 ## Verification
 
 ```sh
@@ -323,7 +504,11 @@ graceful shutdown leaving uncommitted messages unacknowledged; several topic
 filters with redelivery on two unrelated topics after a reconnect and after a
 crash, and adding/removing filters on an existing session; Modbus timeout,
 exception and reconnect with explicit failed observations; concurrent-replayer
-exclusion and sink binding; TLS with a trusted and an untrusted CA.
+exclusion and sink binding; TLS with a trusted and an untrusted CA; payload
+decoding of multi-group batches (bit-exact values) and explicit issues for
+malformed payloads; grid placement with jitter, gaps, duplicates, conflicts,
+out-of-order samples, rate estimation and rate changes; context timelines with repeated values, redelivered and
+late contradicting observations, rebuilt identically from the spool.
 
 Against an external broker (CI runs this with Mosquitto 2):
 
@@ -331,15 +516,21 @@ Against an external broker (CI runs this with Mosquitto 2):
 AKHET_TEST_BROKER_PORT=1883 cargo test --locked --test mqtt_external -- --ignored
 ```
 
+Against MorletDB (CI runs this with the published pg_morlet image; see the
+header of `tests/morlet.rs`):
+
+```sh
+AKHET_TEST_MORLET_URL=postgresql://morlet:morlet-test@127.0.0.1:54339/morlet \
+  cargo test --locked --test morlet -- --ignored --test-threads=1
+```
+
 Not covered: power-failure durability, broker restarts with persistence, real
 Modbus devices, long-duration soak tests, throughput or latency benchmarks.
 
 ## Scope boundaries
 
-- No MorletDB integration. Mapping these generic events into MorletDB needs an
-  explicit contract for payload schema, units, sampling rate, source clock,
-  recording identity and gaps; irregular Modbus polls are not a uniform
-  waveform.
+- The MorletDB sink handles MQTT payloads decoded by rules. Irregular Modbus
+  polls are not a uniform waveform and are not written to MorletDB.
 - No ML, adaptive discarding, Parquet conversion, custom storage engine,
   retention/deletion, fleet management or performance claims.
 

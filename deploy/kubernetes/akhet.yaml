@@ -1,0 +1,167 @@
+# Akhet on Kubernetes: one MQTT collector and one replay process sharing one
+# spool file on one PersistentVolume. See docs/deployment.md.
+#
+# Single writer: a spool file belongs to exactly one collector. Keep
+# `replicas: 1`; scaling up gives each new Pod its own volume and spool (a
+# separate collector with its own --client-id would be needed, which this
+# example does not template). Use a block-backed volume with a local
+# filesystem (e.g. a cloud disk or local-path). SQLite on network filesystems
+# (NFS, SMB, most ReadWriteMany classes) is not supported: their locking and
+# flush semantics break the durability assumptions in the README.
+#
+# Exit codes: a Pod restarts its containers whatever the exit code, so an
+# integrity (3) or capacity (4) failure ends in CrashLoopBackOff rather than
+# a stop. That is harmless (the spool is not modified) but needs a person:
+# alert on restarts and read `kubectl logs --previous`. The systemd units in
+# deploy/systemd can express "do not restart on 3" directly.
+#
+# Create the credentials Secret out of band instead of committing it:
+#   kubectl create secret generic akhet-mqtt \
+#     --from-literal=AKHET_MQTT_USERNAME=... --from-literal=AKHET_MQTT_PASSWORD=...
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: akhet
+  labels:
+    app.kubernetes.io/name: akhet
+data:
+  AKHET_SPOOL: /data/spool.sqlite
+  # Pass the same limit to every process that writes the spool (README).
+  AKHET_MAX_DB_BYTES: "1073741824"
+  AKHET_MQTT_HOST: broker.example.internal
+  AKHET_MQTT_PORT: "1883"
+  AKHET_MQTT_TOPIC: sensors/#
+  # Stable and unique per collector: it names the persistent broker session.
+  AKHET_MQTT_CLIENT_ID: akhet-edge-01
+  AKHET_REPLAY_URL: http://receiver.example.internal:8080
+  AKHET_REPLAY_SINK: central
+---
+# StatefulSet requires a governing Service; nothing is exposed (akhet only
+# makes outbound connections).
+apiVersion: v1
+kind: Service
+metadata:
+  name: akhet
+  labels:
+    app.kubernetes.io/name: akhet
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: akhet
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: akhet
+  labels:
+    app.kubernetes.io/name: akhet
+spec:
+  # Never more than 1 (see top of file). A StatefulSet stops the old Pod
+  # before starting its replacement, so an update never runs two collectors
+  # against the same volume. (A Deployment would need `strategy: Recreate`.)
+  replicas: 1
+  serviceName: akhet
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: akhet
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: akhet
+    spec:
+      # SIGTERM -> graceful stop: finish the in-progress commit, flush PUBACKs,
+      # DISCONNECT (10 s grace). Leave headroom above that.
+      terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          image: ghcr.io/merkhet-io/akhet:0.1.0
+          args:
+            - --max-db-bytes=$(AKHET_MAX_DB_BYTES)
+            - mqtt
+            - --host=$(AKHET_MQTT_HOST)
+            - --port=$(AKHET_MQTT_PORT)
+            - --topic=$(AKHET_MQTT_TOPIC)
+            - --client-id=$(AKHET_MQTT_CLIENT_ID)
+          envFrom:
+            - configMapRef:
+                name: akhet
+          env:
+            - name: AKHET_MQTT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: akhet-mqtt
+                  key: AKHET_MQTT_USERNAME
+            - name: AKHET_MQTT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: akhet-mqtt
+                  key: AKHET_MQTT_PASSWORD
+          volumeMounts:
+            - name: spool
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        # Second container on the same volume: forwards committed records.
+        # It does not get the MQTT credentials.
+        - name: replay
+          image: ghcr.io/merkhet-io/akhet:0.1.0
+          args:
+            - --max-db-bytes=$(AKHET_MAX_DB_BYTES)
+            - replay
+            - --url=$(AKHET_REPLAY_URL)
+            - --sink=$(AKHET_REPLAY_SINK)
+            - --follow
+          envFrom:
+            - configMapRef:
+                name: akhet
+          volumeMounts:
+            - name: spool
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+  volumeClaimTemplates:
+    - metadata:
+        name: spool
+        labels:
+          app.kubernetes.io/name: akhet
+      spec:
+        # ReadWriteOncePod (Kubernetes 1.29+, CSI volumes) additionally stops
+        # a second Pod from mounting the volume at all, if your driver has it.
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName: <a block-backed class, not NFS>
+        resources:
+          requests:
+            # Leave room above AKHET_MAX_DB_BYTES for the rollback journal.
+            storage: 2Gi
