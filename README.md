@@ -21,6 +21,17 @@ alias akhet=./target/release/akhet   # or use `cargo run --release --` below
 akhet --help
 ```
 
+## Deployment
+
+Tagged releases (`v*`) publish static Linux binaries for x86_64 and aarch64
+with `SHA256SUMS` and GitHub build-provenance attestations, plus a multi-arch
+container image (`ghcr.io/merkhet-io/akhet`, distroless, non-root, `/data`
+volume). `deploy/` has hardened systemd units and a single-replica Kubernetes
+StatefulSet. [docs/deployment.md](docs/deployment.md) covers installation,
+verification, the one-collector-per-spool rule and the upgrade path for an
+existing spool (today a build refuses a spool with a different schema version
+rather than migrating it).
+
 ## Local example without hardware
 
 Development-only peers ship as Cargo examples: an embedded MQTT broker
