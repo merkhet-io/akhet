@@ -194,6 +194,9 @@ enum Command {
         /// Create the collection and its context tables if missing.
         #[arg(long)]
         create_collection: bool,
+        /// Do not register sources as MorletDB acquisitions.
+        #[arg(long)]
+        no_acquisitions: bool,
         /// Decoder config file (JSON) with timing and context_signals.
         #[arg(long)]
         config: PathBuf,
@@ -556,6 +559,7 @@ fn main() -> ExitCode {
             sink,
             collection,
             create_collection,
+            no_acquisitions,
             config,
             records_per_tx,
             extractor,
@@ -584,6 +588,7 @@ fn main() -> ExitCode {
             };
             let mut cfg = akhet::morlet::MorletConfig::new(&url, &sink, &collection, decoder);
             cfg.create_collection = create_collection;
+            cfg.acquisitions = !no_acquisitions;
             cfg.records_per_tx = records_per_tx;
             cfg.extractor = extractor;
             cfg.window_size = window_size;

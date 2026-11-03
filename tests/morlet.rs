@@ -73,7 +73,10 @@ const DECODER: &str = r#"{"format_version":1,"rules":[
    "timing":{"rate_hz":40000,"tolerance_ns":2000}},
   {"name":"ctrl","topic":"plant/+/controller","source":"{topic.1}","group":"state",
    "timestamps":"/t","timestamp_unit":"ms","signals":{"list":[{"name":"program","pointer":"/program"}]},
-   "context_signals":["program"]}]}"#;
+   "context_signals":["program"]},
+  {"name":"temp","topic":"plant/+/temp","source":"{topic.1}","group":"thermal",
+   "timestamps":"/t","timestamp_unit":"us","signals":{"list":[{"name":"temp","pointer":"/temp"}]},
+   "units":{"temp":"degC"},"timing":{"rate_hz":1000,"tolerance_ns":2000}}]}"#;
 
 /// Spool: batches 0..6 regular, batch 3 redelivered, a 100-sample gap,
 /// then batches 7..9 regular; program changes 11 -> 2011 -> 11.
@@ -797,4 +800,157 @@ fn dedup_windows_are_stored_incrementally_and_migrated() {
         let (chans, max_n): (i64, i64) = (row.get(0), row.get(1));
         assert_eq!((chans, max_n), (2, 9 * N as i64));
     }
+}
+
+/// One source with two rates: the 40 kHz vibration recordings and a 1 kHz
+/// temperature recording starting 5 ms later are channels of one
+/// acquisition, and a time-interval read returns for every channel the
+/// samples of its own recording at the right offsets.
+#[test]
+#[ignore = "needs AKHET_TEST_MORLET_URL"]
+fn sources_are_acquisitions_read_on_one_time_axis() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("s.sqlite");
+    build_spool(&spool);
+    {
+        let mut sp = Spool::open(&spool, MAX_DB).unwrap();
+        for m in 0..3i64 {
+            let t: Vec<i64> = (0..20)
+                .map(|i| T0_US + 5_000 + (m * 20 + i) * 1_000)
+                .collect();
+            let temp: Vec<f64> = (0..20).map(|i| 20.0 + (m * 20 + i) as f64 / 8.0).collect();
+            let p = serde_json::to_vec(&serde_json::json!({"t": t, "temp": temp})).unwrap();
+            sp.append(&mqtt_event("plant/hub-1/temp", &p), None)
+                .unwrap();
+        }
+    }
+    let cfg = decoder_file(dir.path());
+    let coll = unique("akhet_acq");
+    let out = morlet_run_args(
+        &spool,
+        &cfg,
+        &unique("s"),
+        &coll,
+        None,
+        &["--records-per-tx", "100"],
+    );
+    assert!(out.status.success());
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let acq = db
+        .query(
+            &format!(
+                "SELECT acquisition_id, machine, (extract(epoch FROM origin_utc) * 1000000)::int8 FROM {coll}_acq"
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(acq.len(), 1);
+    let (id, machine, origin_us): (String, String, i64) =
+        (acq[0].get(0), acq[0].get(1), acq[0].get(2));
+    assert_eq!(
+        (id.as_str(), machine.as_str(), origin_us),
+        ("hub-1", "hub-1", T0_US)
+    );
+    let gap_ns = (6 * N as i64 + 100) * 25_000;
+    let t0_ns = T0_US * 1000;
+    let channels: Vec<(String, i64, String, i64)> = db
+        .query(
+            &format!(
+                "SELECT role, offset_ns, clock_source, offset_uncertainty_ns FROM {coll}_acq_channels
+                 WHERE acquisition_id='hub-1' ORDER BY role"
+            ),
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    let ch = |role: String, off: i64, tol: i64| (role, off, "daq".to_string(), tol);
+    assert_eq!(
+        channels,
+        vec![
+            ch(
+                format!("thermal/temp@{}", t0_ns + 5_000_000),
+                5_000_000,
+                2000
+            ),
+            ch(format!("vib/accel_x@{t0_ns}"), 0, 2000),
+            ch(format!("vib/accel_x@{}", t0_ns + gap_ns), gap_ns, 2000),
+            ch(format!("vib/accel_y@{t0_ns}"), 0, 2000),
+            ch(format!("vib/accel_y@{}", t0_ns + gap_ns), gap_ns, 2000),
+        ]
+    );
+
+    // [10 ms, 70 ms) in acquisition time.
+    let rows = db
+        .query(
+            "SELECT role, recording_id, start_sample, end_sample, samples
+             FROM morlet_read_acquisition($1::text::regclass, 'hub-1', 10000000, 70000000) ORDER BY role",
+            &[&coll],
+        )
+        .unwrap();
+    let got: Vec<(String, i64, i64)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(2), r.get(3)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            // 1 kHz from 5 ms: samples 5..60 (the recording has 60).
+            (format!("thermal/temp@{}", t0_ns + 5_000_000), 5, 60),
+            // 40 kHz from 0: samples 400..2400 (the recording has 2400).
+            (format!("vib/accel_x@{t0_ns}"), 400, 2400),
+            // 40 kHz from 62.5 ms: samples 0..300.
+            (format!("vib/accel_x@{}", t0_ns + gap_ns), 0, 300),
+            (format!("vib/accel_y@{t0_ns}"), 400, 2400),
+            (format!("vib/accel_y@{}", t0_ns + gap_ns), 0, 300),
+        ]
+    );
+    for r in &rows {
+        let (rec, s, e, samples): (String, i64, i64, Vec<f64>) =
+            (r.get(1), r.get(2), r.get(3), r.get(4));
+        let direct: Vec<f64> = db
+            .query_one(
+                "SELECT samples FROM morlet_read_interval($1::text::regclass, $2, $3, $4)",
+                &[&coll, &rec, &s, &e],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            samples.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            direct.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{rec}"
+        );
+    }
+    let temp: Vec<f64> = rows[0].get(4);
+    assert_eq!(temp[0], 20.0 + 5.0 / 8.0);
+}
+
+#[test]
+#[ignore = "needs AKHET_TEST_MORLET_URL"]
+fn acquisitions_can_be_turned_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("s.sqlite");
+    let want = build_spool(&spool);
+    let cfg = decoder_file(dir.path());
+    let coll = unique("akhet_noacq");
+    let out = morlet_run_args(
+        &spool,
+        &cfg,
+        &unique("s"),
+        &coll,
+        None,
+        &["--no-acquisitions"],
+    );
+    assert!(out.status.success());
+    assert_exact(&coll, &want);
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let exists: bool = db
+        .query_one(
+            "SELECT to_regclass($1) IS NOT NULL",
+            &[&format!("{coll}_acq")],
+        )
+        .unwrap()
+        .get(0);
+    assert!(!exists);
 }

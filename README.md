@@ -265,6 +265,28 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
   estimated, the tolerance and the discontinuity that started it. Chunks go
   through `morlet_append_chunk` at the grid's sample offsets; values are sent
   as binary float64 and read back bit-exactly.
+- **Acquisitions:** each source is one MorletDB acquisition, so all of its
+  channels can be read on one time axis with
+  `morlet_read_acquisition(collection, '<source>', t_start_ns, t_end_ns)`.
+  Times are nanoseconds from the acquisition's origin.
+  - **Id and machine:** the source name.
+  - **Origin:** the anchor of the source's first recording, truncated to the
+    microsecond (`timestamptz` resolution).
+  - **Channels:** every recording becomes a channel when it starts, with role
+    `<group>/<signal>@<anchor unix ns>`, `offset_ns` = anchor − origin
+    (exact), clock `daq` and offset uncertainty = the grid tolerance.
+  - **Discontinuities:** MorletDB allows one recording per role, and a
+    channel starts a new recording after a discontinuity. The role therefore
+    names the recording; the part before `@` is the channel. One acquisition
+    per source keeps every recording, old and new, on the same time axis.
+  - **Transactions:** registration happens in the same transaction as the
+    samples. MorletDB accepts identical retries.
+  - **Enabling:** `--create-collection` enables acquisitions on the
+    collection (also on an existing one). Without that flag, a collection
+    without acquisition tables gets a warning and no registration.
+    `--no-acquisitions` turns registration off.
+  - **Context:** still written per recording (below), not with
+    `morlet_add_acquisition_context`.
 - **Chunks:** within one transaction, the contiguous samples of a recording
   are merged into one chunk of at most the channel's `max_chunk_samples`
   (default and MorletDB maximum 32,768). They are written before the

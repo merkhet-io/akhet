@@ -68,6 +68,9 @@ pub struct MorletConfig {
     pub collection: String,
     /// Create the collection (and its context tables) if missing.
     pub create_collection: bool,
+    /// Register each source as a MorletDB acquisition and each recording as
+    /// one of its channels (see [`acquisition_role`]).
+    pub acquisitions: bool,
     pub decoder: DecoderConfig,
     /// Spool records per database transaction.
     pub records_per_tx: usize,
@@ -92,6 +95,7 @@ impl MorletConfig {
             sink: sink.into(),
             collection: collection.into(),
             create_collection: false,
+            acquisitions: true,
             decoder,
             records_per_tx: 100,
             window_size: 512,
@@ -159,6 +163,33 @@ struct SourceCtx {
     recordings: BTreeMap<String, RecSpan>,
     intervals: BTreeMap<String, Vec<Interval>>,
     latest_context_ns: Option<i64>,
+    /// Origin of the source's MorletDB acquisition (unix ns, a whole
+    /// microsecond), set when its first recording is registered.
+    #[serde(default)]
+    acquisition_origin_ns: Option<i64>,
+}
+
+/// Role of a recording in its source's acquisition: `<group>/<signal>@<anchor
+/// unix ns>`. MorletDB allows one recording per role, and a channel starts a
+/// new recording after each discontinuity, so the role names the recording;
+/// the part before `@` is the channel.
+pub fn acquisition_role(group: &str, signal: &str, anchor_unix_ns: i64) -> String {
+    format!("{group}/{signal}@{anchor_unix_ns}")
+}
+
+/// Acquisition origin for a first anchor: truncated to the microsecond, the
+/// resolution of `timestamptz`, so channel offsets stay exact nanoseconds.
+fn acquisition_origin(anchor_unix_ns: i64) -> i64 {
+    anchor_unix_ns - anchor_unix_ns.rem_euclid(1000)
+}
+
+fn unix_ns_to_system_time(ns: i64) -> std::time::SystemTime {
+    let d = Duration::from_nanos(ns.unsigned_abs());
+    if ns >= 0 {
+        std::time::UNIX_EPOCH + d
+    } else {
+        std::time::UNIX_EPOCH - d
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -453,12 +484,18 @@ CREATE TABLE IF NOT EXISTS akhet_morlet_issues(
 struct Session<'a> {
     cfg: &'a MorletConfig,
     client: postgres::Client,
+    /// Acquisitions are requested and enabled on the collection.
+    acquisitions: bool,
 }
 
 impl<'a> Session<'a> {
     fn connect(cfg: &'a MorletConfig, pg: &PgConnect) -> Result<Self, TxError> {
         let client = pg.connect().map_err(classify)?;
-        Ok(Session { cfg, client })
+        Ok(Session {
+            cfg,
+            client,
+            acquisitions: false,
+        })
     }
 
     /// Create helper tables (and optionally the collection); return the
@@ -503,6 +540,32 @@ impl<'a> Session<'a> {
                 &[&self.cfg.collection],
             )
             .map_err(classify)?;
+        }
+        self.acquisitions = false;
+        if self.cfg.acquisitions {
+            let enabled: bool = tx
+                .query_one(
+                    "SELECT to_regclass($1 || '_acq') IS NOT NULL",
+                    &[&self.cfg.collection],
+                )
+                .map_err(classify)?
+                .get(0);
+            if enabled {
+                self.acquisitions = true;
+            } else if self.cfg.create_collection {
+                tx.execute(
+                    "SELECT morlet_enable_acquisitions($1::text::regclass)",
+                    &[&self.cfg.collection],
+                )
+                .map_err(classify)?;
+                self.acquisitions = true;
+            } else {
+                eprintln!(
+                    "akhet: morlet: acquisitions are not enabled on {:?}; recordings are not registered as acquisition channels \
+                     (run morlet_enable_acquisitions, or use --create-collection or --no-acquisitions)",
+                    self.cfg.collection
+                );
+            }
         }
         tx.commit().map_err(classify)?;
         Ok(id)
@@ -792,6 +855,44 @@ fn write_batch(
                             ],
                         )
                         .map_err(classify)?;
+                        if sess.acquisitions {
+                            let source = &b.channel.source;
+                            let origin = match src.acquisition_origin_ns {
+                                Some(o) => o,
+                                None => {
+                                    let o = acquisition_origin(s.anchor_unix_ns);
+                                    tx.execute(
+                                        "SELECT morlet_create_acquisition($1::text::regclass,$2,$3,$4,$5)",
+                                        &[
+                                            &coll,
+                                            source,
+                                            source,
+                                            &unix_ns_to_system_time(o),
+                                            &json!({"akhet": {"source": source, "origin_unix_ns": o}}),
+                                        ],
+                                    )
+                                    .map_err(classify)?;
+                                    src.acquisition_origin_ns = Some(o);
+                                    o
+                                }
+                            };
+                            tx.execute(
+                                "SELECT morlet_add_acquisition_channel($1::text::regclass,$2,$3,$4,$5,'daq',$6)",
+                                &[
+                                    &coll,
+                                    source,
+                                    &s.recording,
+                                    &acquisition_role(
+                                        &b.channel.group,
+                                        &b.channel.signal,
+                                        s.anchor_unix_ns,
+                                    ),
+                                    &(s.anchor_unix_ns - origin),
+                                    &(s.tolerance_ns.ceil() as i64),
+                                ],
+                            )
+                            .map_err(classify)?;
+                        }
                         src.recordings.insert(
                             s.recording.clone(),
                             RecSpan {
@@ -1114,6 +1215,23 @@ fn session_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acquisition_origin_is_a_whole_microsecond() {
+        assert_eq!(
+            acquisition_origin(1_700_000_000_000_123_456),
+            1_700_000_000_000_123_000
+        );
+        assert_eq!(acquisition_origin(-1_500), -2_000);
+        assert_eq!(
+            unix_ns_to_system_time(1_000_000_123_000)
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            1_000_000_123_000
+        );
+        assert_eq!(acquisition_role("vib", "x", 42), "vib/x@42");
+    }
 
     #[test]
     fn extractor_follows_pg_morlet_rate_domains() {
