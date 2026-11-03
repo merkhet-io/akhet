@@ -74,6 +74,10 @@ pub struct Rule {
     /// Static metadata attached to every channel decoded by this rule.
     #[serde(default)]
     pub metadata: serde_json::Map<String, Value>,
+    /// How to place this rule's samples on a uniform grid (`akhet grid`).
+    /// Absent: the default (estimated rate, 10% of a period tolerance).
+    #[serde(default)]
+    pub timing: Option<crate::timing::TimingSpec>,
     /// Signal names decoded as context (controller state such as program,
     /// tool or part count) instead of waveform samples. Their values may be
     /// numbers, strings or booleans and need no unit.
@@ -123,6 +127,24 @@ pub struct ChannelId {
     pub source: String,
     pub group: String,
     pub signal: String,
+}
+
+impl ChannelId {
+    /// `source/group/signal`, with `%`, `/` and `@` in each part
+    /// percent-encoded so the key is unambiguous.
+    pub fn key(&self) -> String {
+        let esc = |s: &str| {
+            s.replace('%', "%25")
+                .replace('/', "%2F")
+                .replace('@', "%40")
+        };
+        format!(
+            "{}/{}/{}",
+            esc(&self.source),
+            esc(&self.group),
+            esc(&self.signal)
+        )
+    }
 }
 
 /// Samples of one channel from one message, validated: equal lengths,
@@ -277,6 +299,10 @@ impl DecoderConfig {
                         r.name
                     ));
                 }
+            }
+            if let Some(t) = &r.timing {
+                t.validate()
+                    .map_err(|m| ConfigError::Invalid(format!("rule {:?}: timing: {m}", r.name)))?;
             }
             for (what, t) in [("source", &r.source), ("group", &r.group)] {
                 parse_template(t).map_err(|m| {

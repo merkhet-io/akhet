@@ -1,0 +1,62 @@
+# Akhet replay: forwards committed spool records to an HTTP receiver.
+# Runs independently of the collector (separate process, same spool file);
+# capture continues while the receiver or the network is down.
+[Unit]
+Description=Akhet replay to HTTP receiver
+Documentation=https://github.com/merkhet-io/akhet/blob/main/docs/deployment.md
+Wants=network-online.target
+After=network-online.target akhet-mqtt.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=akhet
+Group=akhet
+# No MQTT credentials here: replay does not need them.
+EnvironmentFile=/etc/akhet/akhet.env
+StateDirectory=akhet
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/local/bin/akhet --max-db-bytes ${AKHET_MAX_DB_BYTES} replay \
+    --url ${AKHET_REPLAY_URL} --sink ${AKHET_REPLAY_SINK} --follow
+
+# Exit codes (README): 6 = receiver unavailable after bounded retries, which
+# is worth retrying later. Do not restart on 2 (configuration), 3 (integrity or
+# sink binding mismatch), 4 (capacity), 5 (receiver rejected a record) or
+# 7 (another replayer holds this sink): those need a person.
+Restart=on-failure
+RestartSec=60s
+RestartPreventExitStatus=2 3 4 5 7
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

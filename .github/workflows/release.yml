@@ -1,0 +1,260 @@
+name: Release
+
+# Publishes only on a pushed `v*` tag. A manual run (workflow_dispatch) builds
+# and smoke-tests the same tarballs and images but publishes nothing: no
+# release, no image push, no attestation.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Nothing by default; each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/merkhet-io/akhet
+  PUBLISH: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    # Native runners per architecture; no cross-compilation and no emulation.
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      # Used only to push the per-architecture image by digest on a tag.
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Version
+        id: version
+        run: |
+          crate_version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$PUBLISH" = "true" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [ "$version" != "$crate_version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version"
+              exit 1
+            fi
+          else
+            version="${crate_version}-dev.${GITHUB_SHA::12}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The static musl binary from the Dockerfile's `binary` stage. The image
+      # build below reuses this builder's layer cache, so the tarball and the
+      # image contain the same binary.
+      - name: Build static binary
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          target: binary
+          outputs: type=local,dest=out
+          provenance: false
+          sbom: false
+
+      - name: Package tarball
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          SOURCE_DATE_EPOCH: ${{ steps.version.outputs.source_date_epoch }}
+        run: |
+          file out/akhet
+          # x86_64 reports "static-pie linked", aarch64 "statically linked".
+          file out/akhet | grep -Eq 'static(ally|-pie) linked'
+          out/akhet --version
+          name="akhet-${VERSION}-${ARCH}-unknown-linux-musl"
+          mkdir -p "stage/$name" dist
+          install -m 0755 out/akhet "stage/$name/akhet"
+          cp -R LICENSE README.md docs deploy "stage/$name/"
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@${SOURCE_DATE_EPOCH}" -C stage -cf - "$name" \
+            | gzip -n -9 > "dist/$name.tar.gz"
+          (cd dist && sha256sum "$name.tar.gz")
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build image for smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: akhet:smoke
+          provenance: false
+          sbom: false
+
+      - name: Smoke test image
+        run: |
+          docker run --rm akhet:smoke --version
+          docker volume create akhet-smoke
+          docker run --rm -v akhet-smoke:/data akhet:smoke status
+          docker run --rm -v akhet-smoke:/data akhet:smoke verify
+          test "$(docker image inspect akhet:smoke --format '{{.Config.User}}')" = "65532:65532"
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+
+      - name: Log in to ghcr.io
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushed by digest only (no tag); the `image` job assembles the
+      # multi-arch index and tags it. Without a tag this step builds only.
+      - name: Build (and on a tag, push by digest)
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            REVISION=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ env.PUBLISH }}
+          provenance: false
+          sbom: false
+
+      - name: Record digest
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+
+      - if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: GitHub release (draft)
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release
+      id-token: write # Sigstore signing certificate for attestations
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: tarball-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+
+      # Created as a draft so a maintainer reviews the notes before publishing.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --draft --verify-tag --title "$TAG" --generate-notes
+
+  image:
+    name: multi-arch image
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # push the index and the attestation
+      id-token: write
+      attestations: write
+      artifact-metadata: write # storage record for the attested image
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          # v1.2.3 -> 1.2.3 and 1.2; `latest` only for non-prerelease tags.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest list
+        id: index
+        working-directory: digests
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          args=()
+          while IFS= read -r tag; do args+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$META_JSON")
+          for d in *; do args+=("${IMAGE}@sha256:${d}"); done
+          docker buildx imagetools create "${args[@]}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          digest=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true

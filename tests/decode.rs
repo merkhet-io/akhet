@@ -171,6 +171,90 @@ fn decode_cli_reports_batches_and_issues() {
 }
 
 #[test]
+fn grid_cli_reports_timing_per_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.sqlite");
+    let cfg_path = dir.path().join("decoder.json");
+    // 40 kHz (25 us period), fixed rate, 2 us tolerance.
+    std::fs::write(
+        &cfg_path,
+        br#"{"format_version":1,"rules":[{"name":"hub","topic":"sensors/+/batch",
+            "source":"{topic.1}","groups":"/groups","group":"{group:/name}",
+            "timestamps":"/timestamps","timestamp_unit":"us","signals":{"map":"/signals"},
+            "units":{"accel_x":"g","accel_y":"g","accel_z":"g","current":"A"},
+            "timing":{"rate_hz":40000,"tolerance_ns":2000}}]}"#,
+    )
+    .unwrap();
+    {
+        let mut spool = Spool::open(&path, MAX_DB).unwrap();
+        let t0 = 1_700_000_000_000_000i64;
+        for k in 0..3 {
+            let p = batch_payload(t0 + k * 400 * 25, 400, k as f64);
+            spool
+                .append(&mqtt_event("sensors/hub-1/batch", &p), None)
+                .unwrap();
+        }
+        // Redelivered copy of the last batch (new event, same samples).
+        let p = batch_payload(t0 + 2 * 400 * 25, 400, 2.0);
+        spool
+            .append(&mqtt_event("sensors/hub-1/batch", &p), None)
+            .unwrap();
+        // Then a gap of 100 samples.
+        let p = batch_payload(t0 + 1300 * 25, 400, 3.0);
+        spool
+            .append(&mqtt_event("sensors/hub-1/batch", &p), None)
+            .unwrap();
+    }
+    let out = run(
+        &path,
+        &["grid", "--config", cfg_path.to_str().unwrap(), "--chunks"],
+        None,
+    );
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let summary = lines.last().unwrap();
+    let chans = summary["channels"].as_array().unwrap();
+    assert_eq!(chans.len(), 4);
+    for c in chans {
+        let r = &c["report"];
+        assert_eq!(r["samples_in"], 2000);
+        assert_eq!(r["samples_placed"], 1600);
+        assert_eq!(r["duplicates_skipped"], 400);
+        assert_eq!(r["recordings"], 2);
+        assert_eq!(r["splits_gap"], 1);
+        assert_eq!(r["missing_samples_in_gaps"], 100);
+        assert_eq!(r["max_reconstruction_error_ns"], 0.0);
+        assert_eq!(r["samples_beyond_tolerance"], 0);
+    }
+    let starts: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|l| l["output"]["type"] == "start")
+        .collect();
+    assert_eq!(starts.len(), 8);
+    let gap = starts
+        .iter()
+        .find(|s| !s["output"]["discontinuity"].is_null())
+        .unwrap();
+    assert_eq!(gap["output"]["discontinuity"]["reason"], "gap");
+    assert!(
+        gap["output"]["recording"]
+            .as_str()
+            .unwrap()
+            .starts_with("hub-1/")
+    );
+    let chunk = lines
+        .iter()
+        .find(|l| l["output"]["type"] == "chunk")
+        .unwrap();
+    assert_eq!(chunk["output"]["sample_count"], 400);
+    assert!(chunk["output"]["values"].is_null());
+}
+
+#[test]
 fn context_timeline_is_rebuilt_exactly_from_the_spool() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("s.sqlite");

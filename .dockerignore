@@ -1,0 +1,8 @@
+# Allowlist: the image build needs only the manifest, lockfile, sources and
+# the licence. Everything else (target/, data/ spools, .git, tests, docs)
+# stays out of the build context.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!LICENSE
