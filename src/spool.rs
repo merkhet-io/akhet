@@ -7,10 +7,18 @@
 //! OS to flush the rollback journal and database file to stable storage. Whether
 //! the data survives a power failure depends on the filesystem and device
 //! honoring those flushes; this has not been power-failure tested.
+//!
+//! Retention: records are only deleted by [`Spool::prune`], which removes a
+//! contiguous prefix of records that every bound sink has acknowledged and
+//! that are older than a minimum age. Freed pages go to SQLite's freelist and
+//! are reused by later appends, so `page_count` stays bounded once pruning
+//! keeps up; the file is never shrunk automatically.
 
 use crate::event::{self, FormatError};
+use crate::faults::{Faults, point};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// SQLite `application_id` marking an Akhet spool ("AKHT").
@@ -23,6 +31,13 @@ pub const DEFAULT_MAX_DB_BYTES: u64 = 1 << 30;
 pub const DEFAULT_MAX_EVENT_BYTES: usize = 1 << 20;
 /// Smallest accepted database-size limit.
 pub const MIN_MAX_DB_BYTES: u64 = 64 * 1024;
+/// Usage levels (percent of `max_page_count`, freelist pages counted as free)
+/// at which appends log a capacity warning.
+pub const CAPACITY_WARN_PERCENT: [u8; 2] = [80, 95];
+/// A warning level is re-armed once usage falls this many points below it.
+const CAPACITY_WARN_HYSTERESIS: f64 = 5.0;
+/// Default number of records deleted per prune transaction.
+pub const DEFAULT_PRUNE_BATCH: usize = 1000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpoolError {
@@ -140,7 +155,86 @@ pub struct SpoolStatus {
     pub max_db_bytes: u64,
     pub db_bytes_used: i64,
     pub file_bytes_on_disk: u64,
+    /// Pages holding data: `page_count - freelist_count`.
+    pub used_pages: i64,
+    /// `used_pages` as a percentage of `max_page_count`.
+    pub used_percent: f64,
+    /// Pages still available for new records (`max_page_count - used_pages`):
+    /// unallocated pages plus freelist pages, which SQLite reuses first.
+    pub headroom_pages: i64,
+    pub headroom_bytes: i64,
+    /// Highest seq that `prune` may delete (minimum checkpoint over all bound
+    /// sinks); `null` when no sink is bound, in which case nothing is pruned.
+    pub prune_safe_seq: Option<i64>,
     pub sinks: Vec<SinkStatus>,
+}
+
+/// Page accounting against the database-size limit.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct Capacity {
+    pub page_size: i64,
+    pub page_count: i64,
+    pub freelist_count: i64,
+    pub max_page_count: i64,
+    pub used_pages: i64,
+    pub headroom_pages: i64,
+    pub used_percent: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PruneOptions {
+    /// Only records whose `appended_unix_ns` is at least this old are deleted.
+    pub min_age: Duration,
+    /// Records deleted per transaction (one commit each).
+    pub batch: usize,
+    /// Report what would be deleted without deleting anything.
+    pub dry_run: bool,
+}
+
+impl Default for PruneOptions {
+    fn default() -> Self {
+        PruneOptions {
+            min_age: Duration::from_secs(24 * 3600),
+            batch: DEFAULT_PRUNE_BATCH,
+            dry_run: false,
+        }
+    }
+}
+
+/// What stopped a prune run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneLimit {
+    /// No sink is bound; nothing is ever deleted then.
+    NoSinkBound,
+    /// Every record up to the minimum sink checkpoint was eligible.
+    MinCheckpoint,
+    /// The next record at or below the minimum checkpoint is younger than
+    /// the minimum age.
+    MinAge,
+    /// Stop was requested between batches.
+    Interrupted,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PruneReport {
+    pub dry_run: bool,
+    pub min_age_secs: u64,
+    /// Records appended at or before this instant were old enough.
+    pub cutoff_unix_ns: i64,
+    pub sinks_bound: i64,
+    /// Minimum checkpoint over all bound sinks (at the last batch).
+    pub safe_seq: Option<i64>,
+    /// Records deleted (or, with `dry_run`, that would be deleted).
+    pub records: u64,
+    pub first_seq: Option<i64>,
+    pub last_seq: Option<i64>,
+    /// Committed delete transactions (0 for a dry run).
+    pub batches: u64,
+    pub limited_by: PruneLimit,
+    pub page_count: i64,
+    pub freelist_count: i64,
+    pub headroom_pages: i64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -156,6 +250,9 @@ pub struct Spool {
     spool_id: String,
     max_db_bytes: u64,
     max_event_bytes: usize,
+    /// Highest capacity warning level (index into CAPACITY_WARN_PERCENT,
+    /// plus one) already logged by this connection; 0 = none.
+    warn_level: usize,
 }
 
 const SCHEMA: &str = "
@@ -230,6 +327,7 @@ impl Spool {
             spool_id: String::new(),
             max_db_bytes,
             max_event_bytes,
+            warn_level: 0,
         };
         spool.init_or_check_schema()?;
         let page_size = pragma_i64(&spool.conn, "page_size")?;
@@ -393,10 +491,208 @@ impl Spool {
             tx.commit()?;
             Ok(out)
         })();
-        res.map_err(|e| match e {
+        let res = res.map_err(|e| match e {
             SpoolError::Sqlite(e) => self.map_full(e),
             other => other,
+        });
+        if let Ok(items) = &res
+            && items
+                .iter()
+                .any(|r| matches!(r, Ok(AppendOutcome::Inserted { .. })))
+        {
+            self.note_capacity();
+        }
+        res
+    }
+
+    /// Page usage against the limit. Freelist pages count as free because
+    /// SQLite reuses them before growing the file.
+    pub fn capacity(&self) -> Result<Capacity> {
+        let page_size = pragma_i64(&self.conn, "page_size")?;
+        let page_count = pragma_i64(&self.conn, "page_count")?;
+        let freelist_count = pragma_i64(&self.conn, "freelist_count")?;
+        let max_page_count = pragma_i64(&self.conn, "max_page_count")?;
+        let used_pages = page_count - freelist_count;
+        Ok(Capacity {
+            page_size,
+            page_count,
+            freelist_count,
+            max_page_count,
+            used_pages,
+            headroom_pages: max_page_count - used_pages,
+            used_percent: used_pages as f64 * 100.0 / max_page_count.max(1) as f64,
         })
+    }
+
+    /// Highest capacity warning threshold (percent) currently armed as
+    /// crossed by this connection, or 0.
+    pub fn capacity_warning_percent(&self) -> u8 {
+        match self.warn_level {
+            0 => 0,
+            n => CAPACITY_WARN_PERCENT[n - 1],
+        }
+    }
+
+    /// Log once per threshold crossing; re-arm when usage drops again.
+    fn note_capacity(&mut self) {
+        let Ok(c) = self.capacity() else { return };
+        let reached = CAPACITY_WARN_PERCENT
+            .iter()
+            .filter(|p| c.used_percent >= f64::from(**p))
+            .count();
+        if reached > self.warn_level {
+            self.warn_level = reached;
+            eprintln!(
+                "akhet: warning: spool at {:.1}% of its database-size limit \
+                 ({} of {} pages used, {} bytes headroom); prune replayed records \
+                 or raise --max-db-bytes before appends are refused",
+                c.used_percent,
+                c.used_pages,
+                c.max_page_count,
+                c.headroom_pages * c.page_size
+            );
+        } else {
+            while self.warn_level > 0
+                && c.used_percent
+                    < f64::from(CAPACITY_WARN_PERCENT[self.warn_level - 1])
+                        - CAPACITY_WARN_HYSTERESIS
+            {
+                self.warn_level -= 1;
+            }
+        }
+    }
+
+    /// Delete records that every bound sink has acknowledged
+    /// (`seq <= min(checkpoint_seq)`) and that were appended at least
+    /// `min_age` ago. Only a contiguous prefix of the spool is deleted: the
+    /// run stops at the first record that is too young or above the minimum
+    /// checkpoint. With no bound sink, nothing is deleted.
+    ///
+    /// Deletion happens in batches of `opts.batch` records, one
+    /// `BEGIN IMMEDIATE ... COMMIT` each, re-reading the sink checkpoints
+    /// inside every transaction. A crash rolls back at most the batch in
+    /// progress. `stop` is checked between batches.
+    pub fn prune(
+        &mut self,
+        opts: &PruneOptions,
+        faults: &Faults,
+        stop: &AtomicBool,
+    ) -> Result<PruneReport> {
+        if opts.batch == 0 {
+            return Err(SpoolError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "prune batch size must be positive",
+            )));
+        }
+        let min_age_ns = i64::try_from(opts.min_age.as_nanos()).unwrap_or(i64::MAX);
+        let cutoff = event::now_unix_ns().saturating_sub(min_age_ns);
+        let mut report = PruneReport {
+            dry_run: opts.dry_run,
+            min_age_secs: opts.min_age.as_secs(),
+            cutoff_unix_ns: cutoff,
+            sinks_bound: 0,
+            safe_seq: None,
+            records: 0,
+            first_seq: None,
+            last_seq: None,
+            batches: 0,
+            limited_by: PruneLimit::NoSinkBound,
+            page_count: 0,
+            freelist_count: 0,
+            headroom_pages: 0,
+        };
+        // Records at or below `cursor` have been deleted (or, in a dry run,
+        // counted) already.
+        let mut cursor = 0i64;
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                report.limited_by = PruneLimit::Interrupted;
+                break;
+            }
+            let behavior = if opts.dry_run {
+                TransactionBehavior::Deferred
+            } else {
+                TransactionBehavior::Immediate
+            };
+            let step = (|| -> Result<Option<(usize, i64, i64, bool)>> {
+                let tx = rusqlite::Transaction::new_unchecked(&self.conn, behavior)?;
+                let (sinks, safe): (i64, Option<i64>) =
+                    tx.query_row("SELECT count(*), min(checkpoint_seq) FROM sinks", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
+                report.sinks_bound = sinks;
+                report.safe_seq = safe;
+                let Some(safe) = safe else {
+                    report.limited_by = PruneLimit::NoSinkBound;
+                    return Ok(None);
+                };
+                let rows: Vec<(i64, i64)> = {
+                    let mut stmt = tx.prepare_cached(
+                        "SELECT seq, appended_unix_ns FROM events
+                         WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3",
+                    )?;
+                    stmt.query_map(params![cursor, safe, opts.batch as i64], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?
+                };
+                let take = rows.iter().take_while(|(_, t)| *t <= cutoff).count();
+                let too_young = take < rows.len();
+                report.limited_by = if too_young {
+                    PruneLimit::MinAge
+                } else {
+                    PruneLimit::MinCheckpoint
+                };
+                if take == 0 {
+                    return Ok(None);
+                }
+                let last = rows[take - 1].0;
+                if !opts.dry_run {
+                    let deleted = tx.execute(
+                        "DELETE FROM events WHERE seq > ?1 AND seq <= ?2",
+                        params![cursor, last],
+                    )?;
+                    if deleted != take {
+                        return Err(SpoolError::Corrupt {
+                            seq: last,
+                            detail: format!(
+                                "prune expected to delete {take} records, deleted {deleted}"
+                            ),
+                        });
+                    }
+                    faults.hit(point::PRUNE_BEFORE_COMMIT);
+                }
+                tx.commit()?;
+                let more = !too_young && rows.len() == opts.batch;
+                Ok(Some((take, rows[0].0, last, more)))
+            })();
+            let step = step.map_err(|e| match e {
+                SpoolError::Sqlite(e) => self.map_full(e),
+                other => other,
+            })?;
+            let Some((n, first, last, more)) = step else {
+                break;
+            };
+            report.first_seq.get_or_insert(first);
+            if !opts.dry_run {
+                report.batches += 1;
+                faults.hit(point::PRUNE_AFTER_COMMIT);
+            }
+            report.records += n as u64;
+            report.last_seq = Some(last);
+            cursor = last;
+            if !more {
+                break;
+            }
+        }
+        let c = self.capacity()?;
+        report.page_count = c.page_count;
+        report.freelist_count = c.freelist_count;
+        report.headroom_pages = c.headroom_pages;
+        if !opts.dry_run {
+            self.note_capacity();
+        }
+        Ok(report)
     }
 
     /// Read up to `limit` records with seq > `after`, verifying checksums and
@@ -526,10 +822,10 @@ impl Spool {
                 .query_row("SELECT count(*), min(seq), max(seq) FROM events", [], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                 })?;
-        let page_size = pragma_i64(&self.conn, "page_size")?;
-        let page_count = pragma_i64(&self.conn, "page_count")?;
-        let freelist_count = pragma_i64(&self.conn, "freelist_count")?;
-        let max_page_count = pragma_i64(&self.conn, "max_page_count")?;
+        let cap = self.capacity()?;
+        let prune_safe_seq: Option<i64> =
+            self.conn
+                .query_row("SELECT min(checkpoint_seq) FROM sinks", [], |r| r.get(0))?;
         let mut stmt = self.conn.prepare(
             "SELECT s.name, s.destination_url, s.receiver_id, s.checkpoint_seq,
                     (SELECT count(*) FROM events e WHERE e.seq > s.checkpoint_seq)
@@ -555,13 +851,18 @@ impl Spool {
             records,
             first_seq,
             last_seq,
-            page_size,
-            page_count,
-            freelist_count,
-            max_page_count,
+            page_size: cap.page_size,
+            page_count: cap.page_count,
+            freelist_count: cap.freelist_count,
+            max_page_count: cap.max_page_count,
             max_db_bytes: self.max_db_bytes,
-            db_bytes_used: page_size * page_count,
+            db_bytes_used: cap.page_size * cap.page_count,
             file_bytes_on_disk: std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0),
+            used_pages: cap.used_pages,
+            used_percent: (cap.used_percent * 10.0).round() / 10.0,
+            headroom_pages: cap.headroom_pages,
+            headroom_bytes: cap.headroom_pages * cap.page_size,
+            prune_safe_seq,
             sinks,
         })
     }
