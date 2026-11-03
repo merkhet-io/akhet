@@ -3,7 +3,7 @@ use akhet::adapters::mqtt::{self, MqttConfig, SourceIdentityConfig, TlsSettings}
 use akhet::adapters::{AsyncSpool, CollectError, Stop};
 use akhet::faults::Faults;
 use akhet::receiver::Receiver;
-use akhet::replay::{self, ReplayConfig, ReplayError};
+use akhet::replay::{self, ReplayConfig, ReplayError, Token};
 use akhet::spool::{self, PruneOptions, Spool, SpoolError};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -20,6 +20,7 @@ mod exit {
     pub const REJECTED: u8 = 5;
     pub const UNAVAILABLE: u8 = 6;
     pub const LOCKED: u8 = 7;
+    pub const AUTH: u8 = 8;
 }
 
 #[derive(Parser)]
@@ -119,10 +120,24 @@ enum Command {
         limit: Option<u64>,
     },
     /// Replay committed records to an HTTP receiver.
+    ///
+    /// A bearer token is read from AKHET_REPLAY_TOKEN (never from arguments).
     Replay {
-        /// Receiver base URL (akhet-replay-v1 protocol).
+        /// Receiver base URL (akhet-replay-v1 protocol), http:// or https://.
         #[arg(long)]
         url: String,
+        /// PEM CA bundle for https (default: platform trust store).
+        #[arg(long)]
+        ca_file: Option<PathBuf>,
+        /// PEM client certificate chain for mutual TLS.
+        #[arg(long, requires = "client_key")]
+        client_cert: Option<PathBuf>,
+        /// PEM private key for --client-cert.
+        #[arg(long, requires = "client_cert")]
+        client_key: Option<PathBuf>,
+        /// Send AKHET_REPLAY_TOKEN even over plain http:// (cleartext).
+        #[arg(long)]
+        allow_insecure_token: bool,
         /// Sink name; its checkpoint is bound to this URL and receiver identity.
         #[arg(long)]
         sink: String,
@@ -238,7 +253,6 @@ enum Command {
         #[arg(long, conflicts_with = "samples")]
         summary_only: bool,
     },
-    /// Run the example HTTP receiver (stores into its own spool file).
     /// Place decoded samples on uniform sample grids (read-only).
     ///
     /// Prints recording starts/ends, timing issues and (with --chunks) chunks
@@ -271,12 +285,25 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Run the example HTTP receiver (stores into its own spool file).
+    ///
+    /// If AKHET_RECEIVER_TOKEN is set, every request must carry it as a
+    /// bearer token.
     Receive {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
         /// Receiver database file.
         #[arg(long)]
         db: PathBuf,
+        /// PEM certificate chain; serve HTTPS.
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key for --tls-cert.
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
+        /// PEM CA bundle; require client certificates issued by it (mTLS).
+        #[arg(long, requires = "tls_cert")]
+        client_ca: Option<PathBuf>,
     },
 }
 
@@ -436,6 +463,10 @@ fn main() -> ExitCode {
         }
         Command::Replay {
             url,
+            ca_file,
+            client_cert,
+            client_key,
+            allow_insecure_token,
             sink,
             timeout_ms,
             max_attempts,
@@ -465,6 +496,13 @@ fn main() -> ExitCode {
             cfg.backoff_max = Duration::from_millis(max_backoff_ms);
             cfg.follow = follow.then(|| Duration::from_millis(follow_interval_ms));
             cfg.limit = limit;
+            cfg.ca_file = ca_file;
+            cfg.client_cert = client_cert.zip(client_key);
+            cfg.allow_insecure_token = allow_insecure_token;
+            cfg.token = match token_from_env("AKHET_REPLAY_TOKEN") {
+                Ok(t) => t,
+                Err(e) => return fail(2, e),
+            };
             let path = cli.spool.clone();
             let max = cli.max_db_bytes;
             let f2 = flag.clone();
@@ -484,6 +522,8 @@ fn main() -> ExitCode {
                         ReplayError::Locked { .. } => exit::LOCKED,
                         ReplayError::Rejected { .. } | ReplayError::Protocol(_) => exit::REJECTED,
                         ReplayError::Unavailable { .. } => exit::UNAVAILABLE,
+                        ReplayError::Unauthorized { .. } | ReplayError::Tls { .. } => exit::AUTH,
+                        ReplayError::Config(_) => 2,
                         _ => exit::ERROR,
                     };
                     fail(code, e)
@@ -680,17 +720,50 @@ fn main() -> ExitCode {
                 Err(e) => fail(spool_exit(&e), e),
             }
         }
-        Command::Receive { listen, db } => {
+        Command::Receive {
+            listen,
+            db,
+            tls_cert,
+            tls_key,
+            client_ca,
+        } => {
+            let token = match token_from_env("AKHET_RECEIVER_TOKEN") {
+                Ok(t) => t,
+                Err(e) => return fail(2, e),
+            };
+            let tls = match tls_cert.zip(tls_key) {
+                None => None,
+                Some((cert, key)) => {
+                    match akhet::tls::server_config(&cert, &key, client_ca.as_deref()) {
+                        Ok(c) => Some(c),
+                        Err(e) => return fail(2, e),
+                    }
+                }
+            };
             let spool = match Spool::open_with_limits(&db, cli.max_db_bytes, cli.max_event_bytes) {
                 Ok(s) => s,
                 Err(e) => return fail(spool_exit(&e), e),
             };
-            let receiver = match Receiver::bind(&listen, spool, faults) {
+            let mut receiver = match Receiver::bind(&listen, spool, faults) {
                 Ok(r) => r,
                 Err(e) => return fail(exit::ERROR, e),
             };
+            let scheme = if tls.is_some() { "https" } else { "http" };
+            let auth = match (&token, &tls, client_ca.is_some()) {
+                (None, _, false) => "no authentication",
+                (None, _, true) => "client certificates required",
+                (Some(_), _, true) => "bearer token and client certificates required",
+                (Some(_), Some(_), false) => "bearer token required",
+                (Some(_), None, false) => "bearer token required, sent in cleartext over http",
+            };
+            if let Some(t) = &token {
+                receiver = receiver.with_token(t.expose());
+            }
+            if let Some(c) = tls {
+                receiver = receiver.with_tls(c);
+            }
             eprintln!(
-                "akhet: receiver {} listening on http://{} (example endpoint; no auth/TLS)",
+                "akhet: receiver {} listening on {scheme}://{} ({auth}; example endpoint)",
                 receiver.receiver_id(),
                 receiver
                     .local_addr()
@@ -703,6 +776,16 @@ fn main() -> ExitCode {
             });
             ExitCode::SUCCESS
         }
+    }
+}
+
+/// A bearer token from the environment; unset or empty means none.
+fn token_from_env(var: &str) -> Result<Option<Token>, String> {
+    match std::env::var(var) {
+        Ok(s) if s.is_empty() => Ok(None),
+        Ok(s) => Token::new(s).map(Some).map_err(|e| format!("{var}: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{var} is not valid UTF-8")),
     }
 }
 

@@ -318,51 +318,12 @@ struct AckNotice {
 }
 
 fn build_tls(t: &TlsSettings) -> Result<TlsConfiguration, CollectError> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-    let cfg_err = |m: String| CollectError::Config(m);
-    let mut roots = rustls::RootCertStore::empty();
-    match &t.ca_file {
-        Some(path) => {
-            for cert in CertificateDer::pem_file_iter(path)
-                .map_err(|e| cfg_err(format!("reading CA file {}: {e}", path.display())))?
-            {
-                let cert = cert.map_err(|e| cfg_err(format!("parsing CA file: {e}")))?;
-                roots
-                    .add(cert)
-                    .map_err(|e| cfg_err(format!("adding CA certificate: {e}")))?;
-            }
-        }
-        None => {
-            let native = rustls_native_certs::load_native_certs();
-            for cert in native.certs {
-                let _ = roots.add(cert);
-            }
-        }
-    }
-    if roots.is_empty() {
-        return Err(cfg_err(
-            "no trusted CA certificates available for TLS".into(),
-        ));
-    }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| cfg_err(format!("TLS setup: {e}")))?
-        .with_root_certificates(roots);
-    let config = match &t.client_cert {
-        None => builder.with_no_client_auth(),
-        Some((cert, key)) => {
-            let chain = CertificateDer::pem_file_iter(cert)
-                .map_err(|e| cfg_err(format!("reading client cert: {e}")))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| cfg_err(format!("parsing client cert: {e}")))?;
-            let key = PrivateKeyDer::from_pem_file(key)
-                .map_err(|e| cfg_err(format!("reading client key: {e}")))?;
-            builder
-                .with_client_auth_cert(chain, key)
-                .map_err(|e| cfg_err(format!("client certificate: {e}")))?
-        }
-    };
+    let client = t
+        .client_cert
+        .as_ref()
+        .map(|(c, k)| (c.as_path(), k.as_path()));
+    let config =
+        crate::tls::client_config(t.ca_file.as_deref(), client).map_err(CollectError::Config)?;
     Ok(TlsConfiguration::Rustls(Arc::new(config)))
 }
 

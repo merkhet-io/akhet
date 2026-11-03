@@ -11,3 +11,4 @@ pub mod receiver;
 pub mod replay;
 pub mod spool;
 pub mod timing;
+pub mod tls;

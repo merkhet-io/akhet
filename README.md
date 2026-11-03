@@ -98,8 +98,9 @@ Crate layout (`src/`):
 | `adapters/mqtt.rs` | MQTT 3.1.1 (rumqttc) with group commit and acknowledgment after commit |
 | `adapters/modbus.rs` | Modbus TCP holding-register polling (tokio-modbus) |
 | `adapters/mod.rs` | Blocking-pool spool handle, stop signal |
-| `replay.rs` | HTTP replay with checkpoint binding, sink lock, bounded retries, optional batch requests |
-| `receiver.rs` | Example HTTP receiver (`akhet receive`) |
+| `replay.rs` | HTTP replay with checkpoint binding, sink lock, bounded retries, optional batch requests, TLS and token auth |
+| `receiver.rs` | Example HTTP receiver (`akhet receive`): minimal HTTP/1.1, optional TLS and auth, batch extension |
+| `tls.rs` | PEM loading and rustls configuration shared by MQTT, replay and receiver |
 | `faults.rs` | Fault injection for crash tests (`AKHET_FAULT`) |
 | `main.rs` | CLI |
 
@@ -439,7 +440,10 @@ and `--sample-quantum` are passed to MorletDB for new recordings.
   with exponential backoff (250 ms doubling, capped by `--max-backoff-ms`,
   default 30 s) up to `--max-attempts` (default 8), then replay exits with code
   6. Permanent failures (409, other 4xx) stop replay at that record with exit
-  code 5. `--follow` keeps polling for new records.
+  code 5. Authentication failures (401/403 from either endpoint, an untrusted
+  or mismatched server certificate, a client certificate the server refuses)
+  are not retried and exit with code 8; the checkpoint stays where it was.
+  `--follow` keeps polling for new records.
 - Optional batch extension `batch-v1` (opt-in with `--records-per-request N`,
   default 1). The receiver advertises it in the identity response
   (`"features": ["batch-v1"]`, plus `batch_max_records`/`batch_max_bytes`);
@@ -455,10 +459,77 @@ and `--sample-quantum` are passed to MorletDB for new recordings.
   is retried as a unit. A crash or lost response re-sends up to a whole
   batch, which the receiver deduplicates per record; records after a rejected
   one may already be stored and show up as duplicates later. Details are in
-  the `src/replay.rs` module docs.
+  the `src/replay.rs` module docs. Batch requests carry the same bearer token and
+  TLS settings as single POSTs.
 - Replay runs independently of acquisition (separate process; the SQLite busy
   timeout coordinates access). Sequence numbers are assigned inside the write
   transaction, so a checkpoint never skips a later-committed lower sequence.
+
+### Secure replay: TLS and bearer tokens
+
+Replay and the example receiver can use TLS (rustls with ring, the same
+rustls 0.23 as the MQTT client), mutual TLS and a bearer token. All three are
+optional and independent; use TLS plus at least one of token or client
+certificate whenever replay crosses a network you do not control.
+
+```sh
+# Receiver: TLS, a required token, and (optionally) required client certificates
+export AKHET_RECEIVER_TOKEN="$(cat /path/to/token)"
+akhet receive --listen 0.0.0.0:8443 --db data/receiver.sqlite \
+  --tls-cert server.pem --tls-key server.key --client-ca clients-ca.pem
+
+# Replay: https, a private CA, the same token, and a client certificate
+export AKHET_REPLAY_TOKEN="$(cat /path/to/token)"
+akhet --spool data/spool.sqlite replay --url https://receiver.example:8443 --sink central \
+  --ca-file ca.pem --client-cert edge.pem --client-key edge.key
+```
+
+- `https://` URLs verify the server certificate and host name against the
+  platform trust store (`rustls-native-certs`), or only against `--ca-file`
+  (PEM bundle) when given. `--client-cert`/`--client-key` (PEM) present a
+  client certificate. TLS options with an `http://` URL are a configuration
+  error (exit 2).
+- The token is read only from `AKHET_REPLAY_TOKEN` / `AKHET_RECEIVER_TOKEN`
+  (never from arguments, so it does not show up in process listings), is never
+  printed, and is sent as `Authorization: Bearer <token>` on every request.
+  Allowed characters: `A-Z a-z 0-9 - . _ ~ + / =`. An empty variable means no
+  token.
+- Replay refuses to send a token over plain `http://` (exit 2, before any
+  connection is made) unless `--allow-insecure-token` is given. The flag exists
+  for loopback use and for a TLS-terminating proxy on the same host; anywhere
+  else the token would travel in cleartext. Replay never follows redirects.
+- The receiver requires the token on every path (including `/v1/identity`) and
+  answers `401` otherwise. It compares SHA-256 digests of the presented and
+  expected tokens in constant time. With `--client-ca`, the TLS handshake fails
+  unless the client presents a certificate chaining to that CA; certificate
+  checks happen at the TLS layer, so they do not produce an HTTP status.
+- Classification: a certificate rejected by either side and `401`/`403` are
+  permanent (exit 8, no retries, checkpoint unchanged). Retrying cannot fix a
+  wrong CA, host name, certificate or token, and repeated attempts with a bad
+  credential only fill logs. Other TLS and network errors stay transient.
+- The receiver's HTTP layer is a small HTTP/1.1 subset written for this
+  example (one request per connection, `Content-Length` bodies only, bounded
+  head and body, 10 s socket timeouts) so that plain TCP and TLS share one code
+  path and the binary carries a single rustls version.
+
+What this protects, and what it does not:
+
+- Protects: confidentiality and integrity of events and the token in transit;
+  the replayer's assurance that it talks to the receiver named in the URL (or
+  holding a certificate from your CA); the receiver's assurance that a client
+  knows the token and, with `--client-ca`, holds a key certified by that CA.
+- Does not protect: **the spool and receiver databases at rest are not
+  encrypted**, and the token sits in the process environment; anyone who can
+  read those files or that environment gets the data or the credential. A
+  token is a shared secret with no expiry, scope or rotation support beyond
+  restarting both sides. A client certificate's identity is not mapped to a
+  sink, source or authorization decision: any certified client may write any
+  event. There is no certificate revocation checking (no CRL/OCSP), no rate
+  limiting, and the single-threaded receiver can be stalled by a slow client
+  for up to its socket timeout. Akhet does not sign events end to end; the
+  receiver trusts whatever an authenticated client sends.
+- The receiver remains an example endpoint. For production, put the protocol
+  behind a service you operate and review.
 
 ## Durability, integrity and limits
 
@@ -549,9 +620,9 @@ and `--sample-quantum` are passed to MorletDB for new recordings.
   segment files. Freelist reuse with bounded delete batches already keeps the
   file bounded without VACUUM; rotation would mainly allow returning space to
   the filesystem and archiving segments, and is left as follow-up work.
-- Security: no encryption at rest, and no HTTP authentication or TLS in the
-  example receiver. Keep spool files in an access-controlled local directory and
-  bind the receiver to loopback or a trusted network.
+- Security: no encryption at rest. Keep spool files in an access-controlled
+  local directory. Without TLS and a token (see Secure replay) bind the
+  receiver to loopback or a trusted network.
 
 ## Exit codes
 
@@ -565,6 +636,7 @@ and `--sample-quantum` are passed to MorletDB for new recordings.
 | 5 | Receiver rejected a record permanently |
 | 6 | Receiver unavailable after bounded retries |
 | 7 | Another replayer holds this sink |
+| 8 | Authentication failed: HTTP 401/403, or a TLS certificate rejected by either side (not retried) |
 
 `akhet morlet` uses the same codes: 3 for sink binding mismatches, 5 for writes
 MorletDB rejects, 6 when the database stays unreachable, 2 for configuration.
@@ -592,7 +664,11 @@ graceful shutdown leaving uncommitted messages unacknowledged; several topic
 filters with redelivery on two unrelated topics after a reconnect and after a
 crash, and adding/removing filters on an existing session; Modbus timeout,
 exception and reconnect with explicit failed observations; concurrent-replayer
-exclusion and sink binding; TLS with a trusted and an untrusted CA; payload
+exclusion and sink binding; MQTT TLS with a trusted and an untrusted CA;
+replay over TLS with a trusted CA, an untrusted CA and a wrong host name;
+mutual TLS with a valid, a foreign and no client certificate; missing and
+wrong tokens (401, checkpoint unchanged); refusal to send a token over plain
+HTTP without the opt-in; malformed and unsupported HTTP requests; payload
 decoding of multi-group batches (bit-exact values) and explicit issues for
 malformed payloads; grid placement with jitter, gaps, duplicates, conflicts,
 out-of-order samples, rate estimation and rate changes; context timelines with repeated values, redelivered and
