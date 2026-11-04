@@ -457,6 +457,14 @@ recordings.
   overflows, messages are lost upstream and Akhet cannot detect it. The bundled
   example broker is in-memory. Observed: rumqttd redelivers with `dup=false`;
   treat `dup` as informational only.
+- Tested with Mosquitto 2 and `persistence true` (`ci/mosquitto-persist.conf`,
+  `autosave_interval 1`): queued messages, and messages Akhet committed but did
+  not acknowledge, survive a clean broker restart and a `SIGKILL` after an
+  autosave; a running collector reconnects across the restart without loss.
+  The same tests fail against `persistence false`. After a broker crash,
+  messages newer than its last autosave are lost upstream; Mosquitto's
+  default `autosave_interval` is 1800 s, so set it to what you can afford to
+  lose.
 - Several filters: `--topic` is repeatable. Filters are validated (non-empty,
   MQTT 3.1.1 wildcard syntax, no duplicates) and subscribed with QoS 1 in one
   SUBSCRIBE; every SUBACK return code is checked. Overlapping filters (e.g.
@@ -921,6 +929,15 @@ Against an external broker (CI runs this with Mosquitto 2):
 AKHET_TEST_BROKER_PORT=1883 cargo test --locked --test mqtt_external -- --ignored
 ```
 
+Broker restarts, against a Mosquitto with persistence that the tests restart
+and kill (CI runs this too; the module docs of `tests/mqtt_broker_restart.rs`
+have the `docker run` line):
+
+```sh
+AKHET_TEST_PERSISTENT_BROKER_PORT=1884 AKHET_TEST_BROKER_CONTAINER=akhet-mosquitto-persist \
+  cargo test --locked --test mqtt_broker_restart -- --ignored --test-threads=1
+```
+
 Group commit and batched replay have their own crash tests: a kill inside a
 batch transaction (`abort:collector.batch_partial`, nothing stored, everything
 redelivered), a kill after a batch commit before its acknowledgments (whole
@@ -941,8 +958,8 @@ AKHET_TEST_MORLET_CERTS=/tmp/akhet-pgcerts \
 The TLS test checks `verify-full` (succeeds with the CA; fails with a wrong
 host name, another CA or no CA), `verify-ca` and the plain loopback default.
 
-Not covered: power-failure durability, broker restarts with persistence, real
-Modbus devices, multi-day soak tests.
+Not covered: power-failure durability, real Modbus devices, multi-day soak
+tests.
 
 ### Benchmark
 
