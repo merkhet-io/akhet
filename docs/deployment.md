@@ -39,7 +39,7 @@ attestation shows it was built by this repository's release workflow from a
 specific commit (signed through Sigstore, checked by the GitHub CLI):
 
 ```sh
-VERSION=0.1.0
+VERSION=0.1.0-alpha.1
 ARCH=aarch64            # or x86_64
 gh release download "v$VERSION" -R merkhet-io/akhet \
   -p "akhet-$VERSION-$ARCH-unknown-linux-musl.tar.gz" -p SHA256SUMS
@@ -60,8 +60,8 @@ against a tampered release.
 ## Container image
 
 ```sh
-docker pull ghcr.io/merkhet-io/akhet:0.1.0
-gh attestation verify oci://ghcr.io/merkhet-io/akhet:0.1.0 -R merkhet-io/akhet
+docker pull ghcr.io/merkhet-io/akhet:0.1.0-alpha.1
+gh attestation verify oci://ghcr.io/merkhet-io/akhet:0.1.0-alpha.1 -R merkhet-io/akhet
 ```
 
 The image is multi-arch (`linux/amd64`, `linux/arm64`) and built from the
@@ -83,16 +83,16 @@ docker volume create akhet-spool
 docker run -d --name akhet-mqtt --restart on-failure \
   -v akhet-spool:/data \
   --env-file ./mqtt-credentials.env \
-  ghcr.io/merkhet-io/akhet:0.1.0 \
+  ghcr.io/merkhet-io/akhet:0.1.0-alpha.1 \
   mqtt --host broker.example.internal --topic 'sensors/#' --client-id akhet-edge-01
 
 # Replay, as a second container on the same volume.
 docker run -d --name akhet-replay --restart on-failure \
   -v akhet-spool:/data \
-  ghcr.io/merkhet-io/akhet:0.1.0 \
+  ghcr.io/merkhet-io/akhet:0.1.0-alpha.1 \
   replay --url http://receiver.example.internal:8080 --sink central --follow
 
-docker run --rm -v akhet-spool:/data ghcr.io/merkhet-io/akhet:0.1.0 status
+docker run --rm -v akhet-spool:/data ghcr.io/merkhet-io/akhet:0.1.0-alpha.1 status
 ```
 
 Use a named volume or a bind mount of a local directory owned by `65532`.
@@ -200,9 +200,9 @@ see the README).
    `sudo systemctl stop akhet-mqtt akhet-replay`
    (or `kubectl scale statefulset akhet --replicas=0`, or `docker stop`).
 2. **Back up the spool.** With everything stopped, a plain copy is
-   consistent: `sudo cp -p /var/lib/akhet/spool.sqlite /var/lib/akhet/spool.sqlite.bak-0.1.0`.
+   consistent: `sudo cp -p /var/lib/akhet/spool.sqlite /var/lib/akhet/spool.sqlite.bak-0.1.0-alpha.1`.
    If a process might still be running, use SQLite's online backup instead of
-   `cp`: `sqlite3 /var/lib/akhet/spool.sqlite ".backup '/var/lib/akhet/spool.sqlite.bak-0.1.0'"`.
+   `cp`: `sqlite3 /var/lib/akhet/spool.sqlite ".backup '/var/lib/akhet/spool.sqlite.bak-0.1.0-alpha.1'"`.
    If a `spool.sqlite-journal` file is still there after the stop (left by
    a crash mid-transaction), it belongs to the database: never delete it by
    hand. Either copy it along with the database, or run step 3 first, which
@@ -215,7 +215,7 @@ see the README).
    the release as above and keep it as `./akhet-new`. Test it against a
    **copy** of the backup:
    ```sh
-   sudo cp /var/lib/akhet/spool.sqlite.bak-0.1.0 /root/akhet-upgrade-test.sqlite
+   sudo cp /var/lib/akhet/spool.sqlite.bak-0.1.0-alpha.1 /root/akhet-upgrade-test.sqlite
    sudo ./akhet-new --spool /root/akhet-upgrade-test.sqlite verify
    sudo ./akhet-new --spool /root/akhet-upgrade-test.sqlite status
    ```
@@ -224,7 +224,7 @@ see the README).
    notes, or stay on the old version. Either way the backup is untouched.
 5. **Swap the binary and restart.**
    ```sh
-   sudo cp -p /usr/local/bin/akhet /usr/local/bin/akhet-0.1.0   # for rollback
+   sudo cp -p /usr/local/bin/akhet /usr/local/bin/akhet-0.1.0-alpha.1   # for rollback
    sudo install -m 0755 akhet-new /usr/local/bin/akhet
    sudo systemctl start akhet-mqtt akhet-replay
    sudo -u akhet akhet --spool /var/lib/akhet/spool.sqlite status
