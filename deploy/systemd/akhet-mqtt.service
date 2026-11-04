@@ -1,8 +1,8 @@
 # Akhet MQTT collector. Install to /etc/systemd/system/ (see docs/deployment.md).
 #
 # Single writer: run exactly one collector per spool file. For Modbus, copy this
-# unit (e.g. akhet-modbus.service) with its own AKHET_SPOOL and an
-# `akhet modbus ...` ExecStart; do not share one spool between two collectors.
+# unit (e.g. akhet-modbus.service) with its own AKHET_SPOOL, an
+# `akhet modbus` ExecStart and a [modbus] table; do not share one spool between two collectors.
 [Unit]
 Description=Akhet MQTT collector (durable local spool)
 Documentation=https://github.com/merkhet-io/akhet/blob/main/docs/deployment.md
@@ -16,15 +16,14 @@ StartLimitBurst=5
 Type=exec
 User=akhet
 Group=akhet
-EnvironmentFile=/etc/akhet/akhet.env
+Environment=AKHET_CONFIG_FILE=/etc/akhet/akhet.toml
 EnvironmentFile=/etc/akhet/mqtt-credentials.env
 # Creates /var/lib/akhet (mode 0700, owned by akhet) and keeps it across restarts.
 StateDirectory=akhet
 StateDirectoryMode=0700
 UMask=0077
-ExecStart=/usr/local/bin/akhet --max-db-bytes ${AKHET_MAX_DB_BYTES} mqtt \
-    --host ${AKHET_MQTT_HOST} --port ${AKHET_MQTT_PORT} \
-    --topic ${AKHET_MQTT_TOPIC} --client-id ${AKHET_MQTT_CLIENT_ID}
+# Options come from [mqtt] and the global keys of /etc/akhet/akhet.toml.
+ExecStart=/usr/local/bin/akhet mqtt
 
 # Exit codes (README): network/TLS errors are retried inside the process, so
 # an exit is not a transient blip. Restart on unexpected failures (1), but not

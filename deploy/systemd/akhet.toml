@@ -1,0 +1,27 @@
+# /etc/akhet/akhet.toml: non-secret settings for both units.
+# Install with: install -m 0644 -o root -g root akhet.toml /etc/akhet/akhet.toml
+#
+# Keys are the long command-line options (`akhet <command> --help`): global
+# options at the top, the others in a table per command. The command line and
+# environment variables take precedence over this file. Secrets (MQTT password,
+# replay token, database URL) are read from the environment only.
+#
+# One collector per spool file. Do not point a second collector (or a second
+# host) at the same file, and keep it on a local filesystem (no NFS/SMB).
+spool = "/var/lib/akhet/spool.sqlite"
+# Every process that writes the spool reads the same limit from here.
+max-db-bytes = 1073741824
+
+# Collector (akhet-mqtt.service)
+[mqtt]
+host = "broker.example.internal"
+port = 1883
+topic = ["sensors/#"]
+# Stable and unique per collector: it names the persistent broker session.
+client-id = "akhet-edge-01"
+
+# Replay (akhet-replay.service)
+[replay]
+url = "http://receiver.example.internal:8080"
+sink = "central"
+follow = true

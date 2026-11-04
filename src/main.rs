@@ -6,7 +6,9 @@ use akhet::metrics::{Metrics, MetricsServer, Mode};
 use akhet::receiver::Receiver;
 use akhet::replay::{self, ReplayConfig, ReplayError, Token};
 use akhet::spool::{self, PruneOptions, Spool, SpoolError};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+
+mod settings;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum PayloadStorageArg {
@@ -60,6 +62,11 @@ struct Cli {
     /// Maximum encoded size of one event.
     #[arg(long, global = true, default_value_t = spool::DEFAULT_MAX_EVENT_BYTES)]
     max_event_bytes: usize,
+    /// Settings file (TOML): long options as keys, global ones at the top,
+    /// the others in a table per subcommand. The command line and
+    /// environment variables take precedence.
+    #[arg(long, global = true, env = "AKHET_CONFIG_FILE")]
+    config_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -444,7 +451,11 @@ fn start_metrics(
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let args = match settings::expand(std::env::args_os().collect(), &Cli::command()) {
+        Ok(a) => a,
+        Err(e) => return fail(2, e),
+    };
+    let cli = Cli::parse_from(args);
     let faults = match Faults::from_env() {
         Ok(f) => f,
         Err(e) => return fail(exit::ERROR, format!("AKHET_FAULT: {e}")),
