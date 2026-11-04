@@ -52,6 +52,27 @@ jobs:
       - if: always()
         run: docker logs mosquitto | tail -50
 
+  broker-restart:
+    name: broker restarts against persistent Mosquitto
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start Mosquitto 2 with persistence (loopback, anonymous, test only)
+        run: |
+          docker run -d --name akhet-mosquitto-persist -p 127.0.0.1:1884:1883 \
+            -v "$PWD/ci/mosquitto-persist.conf:/mosquitto/config/mosquitto.conf:ro" \
+            eclipse-mosquitto:2
+          for i in $(seq 1 50); do nc -z 127.0.0.1 1884 && break; sleep 0.2; done
+      # The tests restart and kill this broker, so they run one at a time.
+      - run: cargo test --locked --test mqtt_broker_restart -- --ignored --test-threads=1
+        env:
+          AKHET_TEST_PERSISTENT_BROKER_PORT: "1884"
+          AKHET_TEST_BROKER_CONTAINER: akhet-mosquitto-persist
+      - if: always()
+        run: docker logs akhet-mosquitto-persist | tail -50
+
   morletdb:
     name: MorletDB sink against pg_morlet
     runs-on: ubuntu-latest
