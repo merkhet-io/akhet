@@ -39,7 +39,7 @@ attestation shows it was built by this repository's release workflow from a
 specific commit (signed through Sigstore, checked by the GitHub CLI):
 
 ```sh
-VERSION=0.1.0-alpha.1
+VERSION=0.1.0-alpha.2
 ARCH=aarch64            # or x86_64
 gh release download "v$VERSION" -R merkhet-io/akhet \
   -p "akhet-$VERSION-$ARCH-unknown-linux-musl.tar.gz" -p SHA256SUMS
@@ -60,8 +60,8 @@ against a tampered release.
 ## Container image
 
 ```sh
-docker pull ghcr.io/merkhet-io/akhet:0.1.0-alpha.1
-gh attestation verify oci://ghcr.io/merkhet-io/akhet:0.1.0-alpha.1 -R merkhet-io/akhet
+docker pull ghcr.io/merkhet-io/akhet:0.1.0-alpha.2
+gh attestation verify oci://ghcr.io/merkhet-io/akhet:0.1.0-alpha.2 -R merkhet-io/akhet
 ```
 
 The image is multi-arch (`linux/amd64`, `linux/arm64`) and built from the
@@ -83,16 +83,16 @@ docker volume create akhet-spool
 docker run -d --name akhet-mqtt --restart on-failure \
   -v akhet-spool:/data \
   --env-file ./mqtt-credentials.env \
-  ghcr.io/merkhet-io/akhet:0.1.0-alpha.1 \
+  ghcr.io/merkhet-io/akhet:0.1.0-alpha.2 \
   mqtt --host broker.example.internal --topic 'sensors/#' --client-id akhet-edge-01
 
 # Replay, as a second container on the same volume.
 docker run -d --name akhet-replay --restart on-failure \
   -v akhet-spool:/data \
-  ghcr.io/merkhet-io/akhet:0.1.0-alpha.1 \
+  ghcr.io/merkhet-io/akhet:0.1.0-alpha.2 \
   replay --url http://receiver.example.internal:8080 --sink central --follow
 
-docker run --rm -v akhet-spool:/data ghcr.io/merkhet-io/akhet:0.1.0-alpha.1 status
+docker run --rm -v akhet-spool:/data ghcr.io/merkhet-io/akhet:0.1.0-alpha.2 status
 ```
 
 Use a named volume or a bind mount of a local directory owned by `65532`.
@@ -144,6 +144,12 @@ What the units do:
 - Hardening: no capabilities, `ProtectSystem=strict`, private `/tmp` and
   devices, a `@system-service` syscall filter and IPv4/IPv6/Unix sockets
   only. `systemd-analyze security` rates both units 1.2 ("OK").
+
+Upgrading units from 0.1.0-alpha.1: those read `/etc/akhet/akhet.env` and
+passed options on the command line. Since 0.1.0-alpha.2 the units read
+`/etc/akhet/akhet.toml` (`AKHET_CONFIG_FILE`); move the values from
+`akhet.env` into it, install the new units and run `systemctl daemon-reload`.
+The credentials file is unchanged.
 
 For Modbus, copy `akhet-mqtt.service` to e.g. `akhet-modbus.service`, give it
 its own spool (`Environment=AKHET_SPOOL=/var/lib/akhet/modbus.sqlite`) and an

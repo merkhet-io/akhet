@@ -88,7 +88,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: collector
-          image: ghcr.io/merkhet-io/akhet:0.1.0
+          image: ghcr.io/merkhet-io/akhet:0.1.0-alpha.2
           args:
             - --max-db-bytes=$(AKHET_MAX_DB_BYTES)
             - mqtt
@@ -127,7 +127,7 @@ spec:
         # Second container on the same volume: forwards committed records.
         # It does not get the MQTT credentials.
         - name: replay
-          image: ghcr.io/merkhet-io/akhet:0.1.0
+          image: ghcr.io/merkhet-io/akhet:0.1.0-alpha.2
           args:
             - --max-db-bytes=$(AKHET_MAX_DB_BYTES)
             - replay
