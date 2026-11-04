@@ -25,12 +25,14 @@ async fn mqtt_and_modbus_to_spool_then_replay_to_receiver() {
     let db = dir.path().join("spool.sqlite");
     let rx_db = dir.path().join("receiver.sqlite");
 
-    let mqtt_port = free_port();
-    broker::start_broker(mqtt_port);
-    let modbus_port = free_port();
-    let l = tokio::net::TcpListener::bind(("127.0.0.1", modbus_port))
+    // Bind the simulator's port first and keep it: a port from free_port()
+    // is released at once and can be taken by the broker before we bind it.
+    let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
+    let modbus_port = l.local_addr().unwrap().port();
+    let mqtt_port = free_port();
+    broker::start_broker(mqtt_port);
     let _sim = tokio::spawn(modbus_sim::serve(l, Default::default()));
 
     // Long-running collectors, stopped later with SIGTERM.
