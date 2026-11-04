@@ -110,7 +110,7 @@ the static binary for the host's architecture:
 | File | Install as | Purpose |
 |---|---|---|
 | `akhet.sysusers` | `/etc/sysusers.d/akhet.conf` | system user `akhet` |
-| `akhet.env` | `/etc/akhet/akhet.env` (0644) | non-secret settings for both units |
+| `akhet.toml` | `/etc/akhet/akhet.toml` (0644) | non-secret settings for both units (settings file) |
 | `mqtt-credentials.env` | `/etc/akhet/mqtt-credentials.env` (0600, root) | `AKHET_MQTT_USERNAME` / `AKHET_MQTT_PASSWORD` |
 | `akhet-mqtt.service` | `/etc/systemd/system/` | MQTT collector |
 | `akhet-replay.service` | `/etc/systemd/system/` | `replay --follow` to the receiver |
@@ -120,9 +120,9 @@ cd deploy/systemd
 sudo install -m 0644 akhet.sysusers /etc/sysusers.d/akhet.conf
 sudo systemd-sysusers
 sudo install -d -m 0755 /etc/akhet
-sudo install -m 0644 akhet.env /etc/akhet/akhet.env
+sudo install -m 0644 akhet.toml /etc/akhet/akhet.toml
 sudo install -m 0600 -o root -g root mqtt-credentials.env /etc/akhet/mqtt-credentials.env
-sudoedit /etc/akhet/akhet.env /etc/akhet/mqtt-credentials.env
+sudoedit /etc/akhet/akhet.toml /etc/akhet/mqtt-credentials.env
 sudo install -m 0644 akhet-mqtt.service akhet-replay.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now akhet-mqtt.service akhet-replay.service
@@ -146,8 +146,9 @@ What the units do:
   only. `systemd-analyze security` rates both units 1.2 ("OK").
 
 For Modbus, copy `akhet-mqtt.service` to e.g. `akhet-modbus.service`, give it
-its own spool (`Environment=AKHET_SPOOL=/var/lib/akhet/modbus.sqlite`) and an
-`akhet modbus ...` command line, and add a matching replay unit with that
+its own spool (`Environment=AKHET_SPOOL=/var/lib/akhet/modbus.sqlite`, which
+takes precedence over the file), an `akhet modbus` command line and a
+`[modbus]` table in `akhet.toml`, and add a matching replay unit with that
 spool. Do not point two collectors at one spool.
 
 ## Kubernetes
