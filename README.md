@@ -1,14 +1,51 @@
-# Akhet
+<p align="center"><img src="assets/brand/readme-hero.svg" alt="Akhet — Commit first. Ack after. Durable edge collection for MQTT and Modbus TCP: a local SQLite spool and independent replay to HTTP receivers and MorletDB." width="100%"></p>
 
-**Durable signal collection and replay: a functional Rust example.**
+<p align="center">
+<span title="Egyptian hieroglyph akhet, U+1320C">𓈌</span><br>
+<i>ꜣḫt</i>, “horizon”<br>
+<sub>Gardiner N27: the sun between two hills, the place where it rises and sets</sub>
+</p>
 
-A small Rust collector that acquires MQTT messages and Modbus TCP holding
-registers, commits each observation to a local SQLite spool, and replays
-committed records to an HTTP receiver independently of acquisition. Capture
-works without any downstream service.
+<p align="center">
+<b>Akhet is a durable signal collector for the edge, written in Rust.</b><br>
+It takes MQTT messages and Modbus TCP registers at the machine, commits each one to a local<br>
+SQLite spool, and replays them later to an HTTP receiver or into MorletDB.
+</p>
+
+<p align="center">
+<a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-a8df73?labelColor=090c0d"></a>
+<a href="https://github.com/merkhet-io/akhet/actions/workflows/ci.yml"><img alt="Rust CI" src="https://github.com/merkhet-io/akhet/actions/workflows/ci.yml/badge.svg"></a>
+<img alt="Rust 1.89+" src="https://img.shields.io/badge/Rust-1.89+-a8df73?labelColor=090c0d&logo=rust&logoColor=e4e8e6">
+<img alt="MQTT 3.1.1 | Modbus TCP" src="https://img.shields.io/badge/MQTT_3.1.1-Modbus_TCP-24302e?labelColor=090c0d">
+<a href="https://github.com/merkhet-io/morletdb"><img alt="Sink: MorletDB" src="https://img.shields.io/badge/sink-MorletDB-24302e?labelColor=090c0d&logo=postgresql&logoColor=e4e8e6"></a>
+</p>
+
+<p align="center">
+<a href="#build">Build</a> · <a href="#architecture">Architecture</a> · <a href="#delivery-semantics">Delivery</a> · <a href="#morletdb-sink">MorletDB sink</a> · <a href="#retention">Retention</a> · <a href="#durability-integrity-and-limits">Limits</a> · <a href="docs/benchmarks.md">Benchmarks</a>
+</p>
+
+---
+
+## Why Akhet
+
+**Commit first, acknowledge after.** An MQTT message is acknowledged to the
+broker only once it is committed to the local spool. A crash, a disconnect or a
+dead uplink leads to a redelivery, not to the loss of an acknowledged message.
+Process crashes are tested; power cuts are not yet (see
+[Durability](#durability-integrity-and-limits)).
+
+- **Capture without a downstream.** Acquisition only writes to local disk.
+  Replay is a separate process that resumes from a checkpoint per sink.
+- **Byte-exact and checked.** Each record is checksummed at capture and
+  replayed with the exact stored bytes; the receiver deduplicates by
+  `event_id`.
+- **From messages to recordings.** Optional rules decode JSON payloads into
+  per-channel sample streams on a fixed rate, measure timing against that
+  grid, and write them into MorletDB with the controller context alongside.
 
 This is infrastructure, not a CNC application, monitoring suite or high-rate
-DAQ.
+DAQ. The name is the Egyptian word for the horizon: the edge where things are
+first seen, before they reach the archive.
 
 ## Build
 

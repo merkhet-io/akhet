@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="500" viewBox="0 0 1280 500" role="img" aria-labelledby="t d">
+<title id="t">Akhet — Commit first. Ack after.</title>
+<desc id="d">Durable edge collection for MQTT and Modbus TCP: a local SQLite spool and independent replay to HTTP receivers and MorletDB. The mark is the hieroglyph akhet, horizon: a sun disc between two hills.</desc>
+<rect width="1280" height="500" rx="18" fill="#090c0d"/>
+<rect x="0.5" y="0.5" width="1279" height="499" rx="18" fill="none" stroke="#24302e"/>
+<g font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <g transform="translate(62,50) scale(0.22)">
+    <path d="M18 88C18 60 28 44 42 44C54 44 61 58 64 74C67 58 74 44 86 44C100 44 110 60 110 88Z" fill="#e4e8e6"/>
+    <circle cx="64" cy="63" r="12" fill="#a8df73" stroke="#090c0d" stroke-width="5"/>
+  </g>
+  <text x="96" y="72" font-size="21" font-weight="650" fill="#e4e8e6" letter-spacing="-0.5">akhet</text>
+  <text x="1216" y="72" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#8a9793" letter-spacing="1.8" text-anchor="end">RUST COLLECTOR · MIT</text>
+  <circle cx="69" cy="139" r="3.5" fill="#a8df73"/>
+  <text x="84" y="143" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#8a9793" letter-spacing="1.9">DURABLE EDGE COLLECTION / MQTT · MODBUS TCP</text>
+  <text x="62" y="236" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="70" font-weight="600" fill="#e4e8e6" letter-spacing="-3">Commit first.</text>
+  <text x="62" y="320" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="70" font-weight="600" fill="#a8df73" letter-spacing="-3">Ack after.</text>
+  <text x="64" y="382" font-size="19" fill="#e4e8e6">An MQTT message is acknowledged only after its local commit.</text>
+  <text x="64" y="414" font-size="16" fill="#8a9793">Spool to SQLite at the machine, replay independently to HTTP receivers</text>
+  <text x="64" y="438" font-size="16" fill="#8a9793">and MorletDB — capture keeps working while the uplink is down.</text>
+</g>
+<g>
+  <line x1="760" y1="330" x2="1216" y2="330" stroke="#24302e"/>
+  <g transform="translate(834,119) scale(2.4)">
+    <path d="M18 88C18 60 28 44 42 44C54 44 61 58 64 74C67 58 74 44 86 44C100 44 110 60 110 88Z" fill="#e4e8e6"/>
+    <circle cx="64" cy="63" r="12" fill="#a8df73" stroke="#090c0d" stroke-width="5"/>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" letter-spacing="1.6" fill="#8a9793" text-anchor="middle">
+    <text x="988" y="372">ꜣḫt · HORIZON · GARDINER N27</text>
+    <text x="988" y="430"><tspan fill="#e4e8e6">MQTT · MODBUS</tspan>  →  <tspan fill="#a8df73">SPOOL</tspan>  →  <tspan fill="#e4e8e6">HTTP · MORLETDB</tspan></text>
+  </g>
+</g>
+</svg>
