@@ -1,14 +1,51 @@
-# Akhet
+<p align="center"><img src="assets/brand/readme-hero.svg" alt="Akhet — Commit first. Ack after. Durable edge collection for MQTT and Modbus TCP: a local SQLite spool and independent replay to HTTP receivers and MorletDB." width="100%"></p>
 
-**Durable signal collection and replay: a functional Rust example.**
+<p align="center">
+<span title="Egyptian hieroglyph akhet, U+1320C">𓈌</span><br>
+<i>ꜣḫt</i>, “horizon”<br>
+<sub>Gardiner N27: the sun between two hills, the place where it rises and sets</sub>
+</p>
 
-A small Rust collector that acquires MQTT messages and Modbus TCP holding
-registers, commits each observation to a local SQLite spool, and replays
-committed records to an HTTP receiver independently of acquisition. Capture
-works without any downstream service.
+<p align="center">
+<b>Akhet is a durable signal collector for the edge, written in Rust.</b><br>
+It takes MQTT messages and Modbus TCP registers at the machine, commits each one to a local<br>
+SQLite spool, and replays them later to an HTTP receiver or into MorletDB.
+</p>
+
+<p align="center">
+<a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-a8df73?labelColor=090c0d"></a>
+<a href="https://github.com/merkhet-io/akhet/actions/workflows/ci.yml"><img alt="Rust CI" src="https://github.com/merkhet-io/akhet/actions/workflows/ci.yml/badge.svg"></a>
+<img alt="Rust 1.89+" src="https://img.shields.io/badge/Rust-1.89+-a8df73?labelColor=090c0d&logo=rust&logoColor=e4e8e6">
+<img alt="MQTT 3.1.1 | Modbus TCP" src="https://img.shields.io/badge/MQTT_3.1.1-Modbus_TCP-24302e?labelColor=090c0d">
+<a href="https://github.com/merkhet-io/morletdb"><img alt="Sink: MorletDB" src="https://img.shields.io/badge/sink-MorletDB-24302e?labelColor=090c0d&logo=postgresql&logoColor=e4e8e6"></a>
+</p>
+
+<p align="center">
+<a href="#build">Build</a> · <a href="#architecture">Architecture</a> · <a href="#delivery-semantics">Delivery</a> · <a href="#morletdb-sink">MorletDB sink</a> · <a href="#retention">Retention</a> · <a href="#durability-integrity-and-limits">Limits</a> · <a href="docs/benchmarks.md">Benchmarks</a>
+</p>
+
+---
+
+## Why Akhet
+
+**Commit first, acknowledge after.** An MQTT message is acknowledged to the
+broker only once it is committed to the local spool. A crash, a disconnect or a
+dead uplink leads to a redelivery, not to the loss of an acknowledged message.
+Process crashes are tested; power cuts are not yet (see
+[Durability](#durability-integrity-and-limits)).
+
+- **Capture without a downstream.** Acquisition only writes to local disk.
+  Replay is a separate process that resumes from a checkpoint per sink.
+- **Byte-exact and checked.** Each record is checksummed at capture and
+  replayed with the exact stored bytes; the receiver deduplicates by
+  `event_id`.
+- **From messages to recordings.** Optional rules decode JSON payloads into
+  per-channel sample streams on a fixed rate, measure timing against that
+  grid, and write them into MorletDB with the controller context alongside.
 
 This is infrastructure, not a CNC application, monitoring suite or high-rate
-DAQ.
+DAQ. The name is the Egyptian word for the horizon: the edge where things are
+first seen, before they reach the archive.
 
 ## Build
 
@@ -93,7 +130,7 @@ Crate layout (`src/`):
 
 | Module | Role |
 |---|---|
-| `event.rs` | Versioned event format (`format_version` 1), encoding, checksums |
+| `event.rs` | Versioned event format (`format_version` 1 and 2), encoding, checksums |
 | `spool.rs` | SQLite spool: schema versioning, append, checksummed reads, capacity, sink checkpoints, pruning |
 | `adapters/mqtt.rs` | MQTT 3.1.1 (rumqttc) with group commit and acknowledgment after commit |
 | `adapters/modbus.rs` | Modbus TCP holding-register polling (tokio-modbus) |
@@ -112,9 +149,11 @@ Replay and the receiver are synchronous. Queues are bounded (see MQTT).
 
 ### Event format
 
-Each record is one JSON object, encoded once at capture. Those exact bytes are
-checksummed (SHA-256), stored, replayed and stored by the receiver; they are
-never re-encoded. Common fields: `format_version`, `event_id` (UUIDv4,
+Each record is encoded once at capture. Those exact bytes are checksummed
+(SHA-256), stored, replayed and stored by the receiver; they are never
+re-encoded. Format version 1 (the default) is one JSON object; format version 2
+(MQTT only, see [Payload storage](#payload-storage)) is a JSON header line
+followed by the raw payload. Common fields: `format_version`, `event_id` (UUIDv4,
 generated once at capture and unchanged by retries), `collected_unix_ns`
 (collector UTC clock), `kind`, optional `source_identity`. Readers reject
 unknown `format_version` values. The format is an example contract, not a
@@ -129,6 +168,32 @@ standard base64), `payload_len`, optional `source_identity_error`.
 `subscriptions` was added within `format_version` 1: records written before it
 lack the field, and in them `subscription` is the single configured filter.
 Readers that ignore unknown fields are unaffected.
+
+#### Payload storage
+
+`mqtt --payload-storage base64|raw` (default `base64`) chooses how MQTT
+payloads are stored:
+
+- `base64`: format version 1, `payload_base64` inside the JSON object. Base64
+  adds a third to the payload; any JSON consumer can read the record.
+- `raw`: format version 2. The body is the same JSON object **without**
+  `payload_base64`, then one newline (`\n`), then exactly `payload_len` raw
+  payload bytes. Compact JSON never contains a raw newline, so the first
+  newline ends the header; the payload may contain anything. Readers check
+  that the byte count matches `payload_len` and that version 2 is used only
+  for `mqtt_message`. On the 8 × 4000-sample JSON benchmark payload the spool
+  shrinks from 8.26 to 6.21 bytes per sample (−25%, within 1% of the payload
+  itself), and both spools return the published payloads bit for bit
+  ([benchmarks](docs/benchmarks.md#spool-size-per-sample)).
+
+Both versions can share a spool, and every reader in this build (`inspect`,
+`decode`, `replay`, the receiver, the MorletDB sink) accepts both. `inspect`
+prints version 2 records with the payload re-attached as `payload_base64`, so
+its output has one shape; the stored bytes are unchanged. Compatibility:
+builds before version 2 refuse these records (unsupported `format_version`),
+so a receiver must run a build that reads version 2, or replay stops with exit
+5 (`422`). Replay sends single version 2 bodies as
+`Content-Type: application/vnd.akhet.event.v2`.
 
 Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
 (`read_holding_registers`), `start_address` (zero-based), `count`,
@@ -469,6 +534,14 @@ recordings.
   overflows, messages are lost upstream and Akhet cannot detect it. The bundled
   example broker is in-memory. Observed: rumqttd redelivers with `dup=false`;
   treat `dup` as informational only.
+- Tested with Mosquitto 2 and `persistence true` (`ci/mosquitto-persist.conf`,
+  `autosave_interval 1`): queued messages, and messages Akhet committed but did
+  not acknowledge, survive a clean broker restart and a `SIGKILL` after an
+  autosave; a running collector reconnects across the restart without loss.
+  The same tests fail against `persistence false`. After a broker crash,
+  messages newer than its last autosave are lost upstream; Mosquitto's
+  default `autosave_interval` is 1800 s, so set it to what you can afford to
+  lose.
 - Several filters: `--topic` is repeatable. Filters are validated (non-empty,
   MQTT 3.1.1 wildcard syntax, no duplicates) and subscribed with QoS 1 in one
   SUBSCRIBE; every SUBACK return code is checked. Overlapping filters (e.g.
@@ -676,7 +749,8 @@ What this protects, and what it does not:
 - Versioning: the file is marked with SQLite `application_id` `0x414B4854`
   and schema `user_version` 1; other files and other schema versions are
   rejected (including the old Python prototype's spool). Events carry
-  `format_version`; unsupported versions are rejected on append and on read.
+  `format_version` (1, or 2 for raw MQTT payloads; the spool schema is the
+  same for both); unsupported versions are rejected on append and on read.
 - Checksums: each stored body has a SHA-256; every read (inspect, replay,
   verify) recomputes it and fails explicitly (exit 3) on mismatch. `verify`
   also runs SQLite `quick_check`.
@@ -933,6 +1007,15 @@ Against an external broker (CI runs this with Mosquitto 2):
 AKHET_TEST_BROKER_PORT=1883 cargo test --locked --test mqtt_external -- --ignored
 ```
 
+Broker restarts, against a Mosquitto with persistence that the tests restart
+and kill (CI runs this too; the module docs of `tests/mqtt_broker_restart.rs`
+have the `docker run` line):
+
+```sh
+AKHET_TEST_PERSISTENT_BROKER_PORT=1884 AKHET_TEST_BROKER_CONTAINER=akhet-mosquitto-persist \
+  cargo test --locked --test mqtt_broker_restart -- --ignored --test-threads=1
+```
+
 Group commit and batched replay have their own crash tests: a kill inside a
 batch transaction (`abort:collector.batch_partial`, nothing stored, everything
 redelivered), a kill after a batch commit before its acknowledgments (whole
@@ -954,8 +1037,8 @@ AKHET_TEST_MORLET_CERTS=/tmp/akhet-pgcerts \
 The TLS test checks `verify-full` (succeeds with the CA; fails with a wrong
 host name, another CA or no CA), `verify-ca` and the plain loopback default.
 
-Not covered: power-failure durability, broker restarts with persistence, real
-Modbus devices, multi-day soak tests.
+Not covered: power-failure durability, real Modbus devices, multi-day soak
+tests.
 
 ### Benchmark
 
@@ -981,6 +1064,8 @@ against `AKHET_MORLET_URL`; see the MorletDB section of the same document. `exam
 
 - The MorletDB sink handles MQTT payloads decoded by rules. Irregular Modbus
   polls are not a uniform waveform and are not written to MorletDB.
+- Payloads are stored as received (base64 or raw). Lossless sample coding at
+  the edge, e.g. with the MorletDB codec before replay, is not implemented.
 - No ML, adaptive discarding, Parquet conversion, custom storage engine,
   segment rotation, fleet management or performance claims beyond the
   measurements in docs/benchmarks.md. Deletion exists only as the explicit,

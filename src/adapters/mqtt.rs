@@ -43,7 +43,6 @@ use super::{AsyncSpool, CollectError, Stop, log};
 use crate::event::{self, Event, EventData, MqttMessage, SourceIdentity};
 use crate::faults::point;
 use crate::spool::{AppendOutcome, SourceClaim};
-use base64::Engine as _;
 use rumqttc::{
     AsyncClient, ConnectReturnCode, ConnectionError, Event as MqEvent, EventLoop, MqttOptions,
     Outgoing, Packet, Publish, QoS, StateError, SubscribeFilter, SubscribeReasonCode,
@@ -94,6 +93,9 @@ pub struct MqttConfig {
     pub password: Option<String>,
     pub keep_alive: Duration,
     pub max_payload_bytes: usize,
+    /// Base64 inside JSON (format version 1, the default) or raw bytes after
+    /// the JSON header (format version 2).
+    pub payload_storage: crate::event::PayloadStorage,
     pub queue_capacity: usize,
     /// Most messages committed in one spool transaction (group commit).
     /// 1 commits every message in its own transaction.
@@ -133,6 +135,7 @@ impl MqttConfig {
             password: None,
             keep_alive: Duration::from_secs(30),
             max_payload_bytes: 256 * 1024,
+            payload_storage: crate::event::PayloadStorage::Base64,
             queue_capacity: 64,
             max_batch: 64,
             max_linger: Duration::ZERO,
@@ -391,10 +394,12 @@ fn to_event(cfg: &MqttConfig, r: &Received) -> (Event, Option<SourceClaim>) {
         qos: p.qos as u8,
         retain: p.retain,
         dup: p.dup,
-        payload_base64: base64::engine::general_purpose::STANDARD.encode(&p.payload),
-        payload_len: p.payload.len(),
+        payload_base64: None,
+        payload_raw: None,
+        payload_len: 0,
         source_identity_error: None,
     };
+    msg.set_payload(&p.payload, cfg.payload_storage);
     let mut identity = None;
     let mut claim = None;
     if let Some(si) = &cfg.source_identity {

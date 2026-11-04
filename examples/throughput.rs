@@ -20,6 +20,12 @@
 //! Replay: the spool of the saturated group-commit run is replayed to a fresh
 //! receiver with single POSTs and with the `batch-v1` extension.
 //!
+//! Spool size: the daq run with group commit, once with payloads stored as
+//! base64 (event format version 1, the default) and once as raw bytes
+//! (`--payload-storage raw`, format version 2). Reports spool bytes per
+//! sample and checks that both spools return the published payloads bit for
+//! bit.
+//!
 //! Payload "daq": 8 channels x 4000 samples per 100 ms as JSON (40 kHz per
 //! channel), integer samples in -32768..=32767; about 200 KB per message.
 //! Payload "small": a JSON object of about 40 bytes. Development tooling only.
@@ -29,6 +35,7 @@ mod broker;
 
 use akhet::adapters::mqtt::{self, MqttConfig};
 use akhet::adapters::{AsyncSpool, CommitStat, Stop};
+use akhet::event::{EventData, PayloadStorage};
 use akhet::faults::Faults;
 use akhet::receiver::Receiver;
 use akhet::replay::{self, ReplayConfig};
@@ -125,6 +132,7 @@ struct MqttResult {
 
 /// Publish `n` messages (paced at `interval` if given) while a collector with
 /// `max_batch` commits them; return when all are committed.
+#[allow(clippy::too_many_arguments)]
 fn run_mqtt(
     broker_port: u16,
     dir: &Path,
@@ -133,6 +141,7 @@ fn run_mqtt(
     n: usize,
     max_batch: usize,
     interval: Option<Duration>,
+    storage: PayloadStorage,
 ) -> MqttResult {
     let db = dir.join(format!("{tag}.sqlite"));
     let spool = Spool::open(&db, MAX_DB).unwrap();
@@ -147,6 +156,7 @@ fn run_mqtt(
     );
     cfg.max_payload_bytes = 512 * 1024;
     cfg.max_batch = max_batch;
+    cfg.payload_storage = storage;
     cfg.limit = Some(n as u64);
     let ready = Arc::new(tokio::sync::Notify::new());
     cfg.ready = Some(ready.clone());
@@ -323,7 +333,16 @@ fn main() {
                     "{}-b{max_batch}-r{run}",
                     if shape == Shape::Daq { "daq" } else { "small" }
                 );
-                let r = run_mqtt(port, dir, &tag, shape, n, max_batch, None);
+                let r = run_mqtt(
+                    port,
+                    dir,
+                    &tag,
+                    shape,
+                    n,
+                    max_batch,
+                    None,
+                    PayloadStorage::Base64,
+                );
                 let secs = r.elapsed.as_secs_f64();
                 eprintln!(
                     "{tag}: {} msgs in {secs:.2}s (publisher done after {:.2}s), {} txns",
@@ -376,6 +395,7 @@ fn main() {
             paced_n,
             max_batch,
             Some(Duration::from_millis(100)),
+            PayloadStorage::Base64,
         );
         let mut l: Vec<Duration> = r.commits.iter().map(|c| c.duration).collect();
         l.sort();
@@ -386,6 +406,60 @@ fn main() {
             ms(pct(&l, 0.5)),
             ms(pct(&l, 0.99)),
             ms(*l.last().unwrap()),
+        );
+    }
+
+    let size_n = 300 / scale;
+    println!(
+        "\n## Spool size per sample (daq, max_batch 64, {size_n} messages), median of {runs} run(s)\n"
+    );
+    println!(
+        "| payload storage | event format | spool bytes | spool B/sample | spool / payload | msg/s | bit-exact |"
+    );
+    println!("|---|---|---|---|---|---|---|");
+    let channels = daq_channels();
+    let sent: Vec<Vec<u8>> = (0..size_n)
+        .map(|i| payload(Shape::Daq, &channels, i))
+        .collect();
+    let samples = (size_n * CHANNELS * SAMPLES) as f64;
+    for (storage, name, version) in [
+        (PayloadStorage::Base64, "base64", 1),
+        (PayloadStorage::Raw, "raw", 2),
+    ] {
+        let mut sizes = Vec::new();
+        let mut rates = Vec::new();
+        let mut payload_bytes = 0;
+        let mut exact = true;
+        for run in 0..runs {
+            let tag = format!("size-{name}-r{run}");
+            let r = run_mqtt(port, dir, &tag, Shape::Daq, size_n, 64, None, storage);
+            payload_bytes = r.payload_bytes;
+            sizes.push(r.spool_bytes as f64);
+            rates.push(r.messages as f64 / r.elapsed.as_secs_f64());
+            let spool = Spool::open(dir.join(format!("{tag}.sqlite")), MAX_DB).unwrap();
+            let mut stored: Vec<Vec<u8>> = Vec::new();
+            for rec in spool.read_after(0, size_n + 1).unwrap() {
+                let (_, v) = akhet::event::check_body_version(&rec.body).unwrap();
+                assert_eq!(v, version);
+                let ev = akhet::event::decode(&rec.body).unwrap();
+                let EventData::MqttMessage(m) = ev.data else {
+                    panic!("not MQTT")
+                };
+                stored.push(m.payload().unwrap().into_owned());
+            }
+            // Redelivery could add duplicates; compare as sorted lists.
+            stored.sort();
+            let mut want = sent.clone();
+            want.sort();
+            exact &= stored == want;
+        }
+        let size = median(sizes);
+        println!(
+            "| {name} | {version} | {size:.0} | {:.2} | {:.3} | {:.0} | {} |",
+            size / samples,
+            size / payload_bytes as f64,
+            median(rates),
+            if exact { "yes" } else { "NO" },
         );
     }
 

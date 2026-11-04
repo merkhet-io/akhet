@@ -37,7 +37,8 @@ fn mqtt_event(topic: &str, payload: &[u8]) -> Event {
             qos: 1,
             retain: false,
             dup: false,
-            payload_base64: base64::engine::general_purpose::STANDARD.encode(payload),
+            payload_base64: Some(base64::engine::general_purpose::STANDARD.encode(payload)),
+            payload_raw: None,
             payload_len: payload.len(),
             source_identity_error: None,
         }),
@@ -1178,4 +1179,41 @@ fn chunk_summaries_are_added_to_an_existing_collection_only_when_asked() {
         .unwrap();
     }
     assert_eq!(summary_column(&coll), Some((chunks, chunks)));
+}
+
+#[test]
+#[ignore = "needs AKHET_TEST_MORLET_URL (see ci/morletdb-test.sh)"]
+fn raw_payload_storage_writes_the_same_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = dir.path().join("v1.sqlite");
+    let want = build_spool(&v1);
+    // The same events, in the same order, with payloads stored raw (format
+    // version 2).
+    let v2 = dir.path().join("v2.sqlite");
+    let mut out = Spool::open(&v2, MAX_DB).unwrap();
+    let mut converted = 0;
+    for rec in Spool::open(&v1, MAX_DB)
+        .unwrap()
+        .read_after(0, 100_000)
+        .unwrap()
+    {
+        let mut ev = akhet::event::decode(&rec.body).unwrap();
+        if let EventData::MqttMessage(m) = &mut ev.data {
+            let p = m.payload().unwrap().into_owned();
+            m.set_payload(&p, akhet::event::PayloadStorage::Raw);
+            converted += 1;
+        }
+        out.append(&ev, None).unwrap();
+    }
+    assert!(converted > 0);
+    let cfg = decoder_file(dir.path());
+    let coll = unique("akhet_raw");
+    let out = morlet_run(&v2, &cfg, &unique("s"), &coll, None);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_json(&out)["samples"], 2 * 9 * N as u64);
+    assert_exact(&coll, &want);
 }
