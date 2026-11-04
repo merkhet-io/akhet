@@ -397,5 +397,17 @@ mod shipped {
         }
     }
 
+    /// The CNC example parses for the commands it configures.
+    #[test]
+    fn cnc_example_parses() {
+        let text = include_str!("../deploy/examples/cnc-sensor-hub.toml");
+        let table: toml::Table = text.parse().unwrap();
+        for sub in ["mqtt", "morlet", "status"] {
+            let args = vec![OsString::from("akhet"), sub.into()];
+            let out = expand_table(args, &crate::Cli::command(), &table).unwrap();
+            crate::Cli::try_parse_from(&out).unwrap_or_else(|e| panic!("{sub}: {e}\n{out:?}"));
+        }
+    }
+
     use std::path::Path;
 }

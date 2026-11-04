@@ -1,0 +1,54 @@
+# Example settings for one CNC machine with a vibration sensor hub and a
+# controller adapter that publish to an MQTT broker on the plant network.
+# Akhet runs next to the machine as a second subscriber, keeps a local spool
+# and writes into a local MorletDB. Start it as two processes on one file:
+#
+#   akhet --config-file akhet.toml mqtt      # collector
+#   akhet --config-file akhet.toml morlet    # sink (AKHET_MORLET_URL in the environment)
+#
+# Values marked <...> in comments must be measured or agreed on site.
+
+spool = "/var/lib/akhet/spool.sqlite"
+# Size to the box's disk and leave headroom. At this limit the collector stops
+# with exit 4 and messages stay unacknowledged at the broker; nothing is
+# overwritten.
+max-db-bytes = 34359738368   # 32 GiB
+
+[mqtt]
+host = "broker.example.internal"
+# Plant brokers often listen on a port other than 1883; check the publisher's
+# configuration.
+port = 1886
+# One collector, both topics: the hub's samples and the controller's signals
+# (program number, workpiece count) that become context in MorletDB.
+topic = ["plant/line-1/sensor-hub", "plant/line-1/controller"]
+# Stable and unique: it names the persistent broker session. Never random
+# (a random id loses the broker's queue on every restart).
+client-id = "akhet-line-1"
+# JSON payloads: about 25% smaller spool. The MorletDB sink reads both
+# formats; an HTTP receiver needs Akhet with format version 2.
+payload-storage = "raw"
+# Group commit for a high-rate hub: up to 64 messages per transaction, waiting
+# at most 5 ms for more. Each message is acknowledged after its commit.
+max-batch = 64
+max-linger-ms = 5
+queue-capacity = 256
+# Largest expected message: <hub rate> x <channels> x <samples per message>.
+# The default is 256 KiB. A larger message cannot be acknowledged, so the
+# collector stops rather than lose it. Above about 700 KiB also raise the
+# global max-event-bytes (default 1 MiB); the collector checks this at start.
+# max-payload-bytes = 1048576
+# Prometheus metrics, health and readiness on loopback only.
+metrics-listen = "127.0.0.1:9464"
+
+[morlet]
+sink = "local"
+collection = "signals"
+# Decoder rules (JSON): which topics carry samples, their channels and rates,
+# and which controller signals are context. See examples/decoder.json.
+config = "/etc/akhet/decoder.json"
+create-collection = true
+follow = true
+# A change of program starts a new acquisition, so each program run is one
+# unit to compare against earlier runs of the same program.
+acquisition-context = ["program"]
