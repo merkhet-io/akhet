@@ -149,6 +149,9 @@ akhet --config-file akhet.toml replay --limit 100   # the command line still win
   working directory, as on the command line.
   [`deploy/systemd/akhet.toml`](deploy/systemd/akhet.toml) is the example
   used by the systemd units.
+  [`deploy/examples/cnc-sensor-hub.toml`](deploy/examples/cnc-sensor-hub.toml)
+  is a commented setup for one CNC machine with a sensor hub and a controller
+  adapter, written into a local MorletDB.
 
 ## Architecture
 
