@@ -68,6 +68,10 @@ pub struct MorletConfig {
     pub collection: String,
     /// Create the collection (and its context tables) if missing.
     pub create_collection: bool,
+    /// Keep MorletDB per-chunk summaries (`morlet_enable_chunk_summaries`)
+    /// on collections this sink creates or enables, so interval statistics
+    /// over long ranges read summaries instead of decoding chunks.
+    pub chunk_summaries: bool,
     /// Register each source's recordings as channels of bounded MorletDB
     /// acquisitions (see [`open_acquisition`]).
     pub acquisitions: bool,
@@ -100,6 +104,7 @@ impl MorletConfig {
             sink: sink.into(),
             collection: collection.into(),
             create_collection: false,
+            chunk_summaries: true,
             acquisitions: true,
             acquisition_context: Vec::new(),
             acquisition_period_s: Some(86_400),
@@ -567,6 +572,63 @@ CREATE TABLE IF NOT EXISTS akhet_morlet_issues(
   PRIMARY KEY(sink, spool_seq, ordinal));
 ";
 
+/// Enable chunk summaries on a collection this sink created (or on any
+/// collection with `--create-collection`), otherwise warn when they are
+/// missing. Appends store each new chunk's summary; chunks stored before
+/// summaries were enabled are covered by `morlet_build_chunk_summaries`.
+fn setup_chunk_summaries(
+    cfg: &MorletConfig,
+    tx: &mut postgres::Transaction,
+    created: bool,
+) -> Result<(), TxError> {
+    let coll = &cfg.collection;
+    let available: bool = tx
+        .query_one(
+            "SELECT to_regprocedure('public.morlet_enable_chunk_summaries(regclass)') IS NOT NULL",
+            &[],
+        )
+        .map_err(classify)?
+        .get(0);
+    if !available {
+        eprintln!(
+            "akhet: morlet: this pg_morlet has no chunk summaries (added in 0.3.4-alpha.1); \
+             interval statistics decode every chunk (upgrade pg_morlet, or use --no-chunk-summaries)"
+        );
+        return Ok(());
+    }
+    let summarized: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass($1 || '_chunks') \
+             AND attname='summary' AND NOT attisdropped)",
+            &[coll],
+        )
+        .map_err(classify)?
+        .get(0);
+    if summarized {
+        return Ok(());
+    }
+    if !cfg.create_collection {
+        eprintln!(
+            "akhet: morlet: chunk summaries are not enabled on {coll:?}; interval statistics decode every chunk \
+             (run morlet_enable_chunk_summaries and then morlet_build_chunk_summaries per recording, \
+             or use --create-collection or --no-chunk-summaries)"
+        );
+        return Ok(());
+    }
+    tx.execute(
+        "SELECT morlet_enable_chunk_summaries($1::text::regclass)",
+        &[coll],
+    )
+    .map_err(classify)?;
+    if !created {
+        eprintln!(
+            "akhet: morlet: enabled chunk summaries on {coll:?}; chunks stored before have none \
+             (run morlet_build_chunk_summaries per recording to cover them)"
+        );
+    }
+    Ok(())
+}
+
 struct Session<'a> {
     cfg: &'a MorletConfig,
     client: postgres::Client,
@@ -626,6 +688,9 @@ impl<'a> Session<'a> {
                 &[&self.cfg.collection],
             )
             .map_err(classify)?;
+        }
+        if self.cfg.chunk_summaries {
+            setup_chunk_summaries(self.cfg, &mut tx, !exists)?;
         }
         self.acquisitions = false;
         if self.cfg.acquisitions {
