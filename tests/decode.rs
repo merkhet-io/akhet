@@ -19,7 +19,8 @@ fn mqtt_event(topic: &str, payload: &[u8]) -> Event {
             qos: 1,
             retain: false,
             dup: false,
-            payload_base64: base64::engine::general_purpose::STANDARD.encode(payload),
+            payload_base64: Some(base64::engine::general_purpose::STANDARD.encode(payload)),
+            payload_raw: None,
             payload_len: payload.len(),
             source_identity_error: None,
         }),
@@ -341,4 +342,33 @@ fn context_timeline_is_rebuilt_exactly_from_the_spool() {
     assert_eq!(prog["report"]["changes"], 4);
     assert_eq!(prog["report"]["late_consistent"], 3);
     assert_eq!(prog["report"]["late_conflicts"], 1);
+}
+
+#[test]
+fn raw_payload_storage_decodes_to_the_same_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = Spool::open(dir.path().join("s.sqlite"), MAX_DB).unwrap();
+    let cfg = example_config();
+    let payload = batch_payload(1_700_000_000_000_000, 4000, 1.0);
+    let v1 = mqtt_event("sensors/hub-1/batch", &payload);
+    let mut v2 = mqtt_event("sensors/hub-1/batch", &payload);
+    if let EventData::MqttMessage(m) = &mut v2.data {
+        m.set_payload(&payload, akhet::event::PayloadStorage::Raw);
+    }
+    spool.append(&v1, None).unwrap();
+    spool.append(&v2, None).unwrap();
+    let recs = spool.read_after(0, 10).unwrap();
+    assert_eq!(
+        akhet::event::check_body_version(&recs[1].body).unwrap().1,
+        2
+    );
+    assert!(recs[1].body.len() < recs[0].body.len());
+    let d1 = cfg
+        .decode_event(&akhet::event::decode(&recs[0].body).unwrap())
+        .unwrap();
+    let d2 = cfg
+        .decode_event(&akhet::event::decode(&recs[1].body).unwrap())
+        .unwrap();
+    assert!(d1.issues.is_empty() && d2.issues.is_empty());
+    assert_eq!(d1, d2);
 }

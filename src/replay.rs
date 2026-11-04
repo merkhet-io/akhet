@@ -137,6 +137,17 @@ impl std::fmt::Debug for Token {
 pub const BATCH_FEATURE: &str = "batch-v1";
 /// Content type of a `batch-v1` request body.
 pub const BATCH_CONTENT_TYPE: &str = "application/vnd.akhet.event-batch.v1";
+/// Content type of a single format-version-2 body (JSON header, newline, raw
+/// payload). Version 1 bodies are plain `application/json`.
+pub const RAW_EVENT_CONTENT_TYPE: &str = "application/vnd.akhet.event.v2";
+
+fn event_content_type(body: &[u8]) -> &'static str {
+    if body.contains(&b'\n') {
+        RAW_EVENT_CONTENT_TYPE
+    } else {
+        "application/json"
+    }
+}
 
 impl ReplayConfig {
     pub fn new(url: &str, sink: &str) -> Self {
@@ -847,7 +858,7 @@ pub fn run(
             let sha = hex::encode(rec.body_sha256);
             let attempt = with_retries(cfg, stop, &mut summary.retries, || {
                 let r = request(agent.post(&events_url), token)
-                    .header("Content-Type", "application/json")
+                    .header("Content-Type", event_content_type(&rec.body))
                     .header("Idempotency-Key", &rec.event_id)
                     .header("Akhet-Body-SHA256", &sha)
                     .send(&rec.body[..]);

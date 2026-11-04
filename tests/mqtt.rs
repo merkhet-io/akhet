@@ -139,6 +139,88 @@ async fn captures_payload_bytes_topic_and_flags() {
     assert!(raw.get("packet_id").is_none());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_payload_storage_writes_version_2_and_replays_byte_identical() {
+    let port = free_port();
+    broker::start_broker(port);
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("spool.sqlite");
+    let mut c = cfg(port, "akhet-raw", "plant/#");
+    c.payload_storage = akhet::event::PayloadStorage::Raw;
+    let r = ready(&mut c);
+    c.limit = Some(3);
+    let db2 = db.clone();
+    let h = tokio::spawn(async move { run_collector(c, &db2, Faults::none(), Stop::new()).await });
+    r.await;
+    // Contains newlines, so a header/payload split in the wrong place shows.
+    let binary: Vec<u8> = (0u8..=255).rev().collect();
+    let json = br#"{"v":[1,2,3]}"#.repeat(100);
+    let sent = vec![binary.clone(), json.clone(), Vec::new()];
+    publish(
+        port,
+        "pub-raw",
+        &[
+            ("plant/a/raw", binary, false),
+            ("plant/b/json", json.clone(), false),
+            ("plant/a/empty", Vec::new(), false),
+        ],
+    )
+    .await;
+    let summary = tokio::time::timeout(Duration::from_secs(20), h)
+        .await
+        .expect("collector finished")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.committed, 3, "{summary:?}");
+
+    for e in events(&db) {
+        assert_eq!(e["format_version"], 2, "{e}");
+    }
+    assert_eq!(multiset(payloads(&db)), multiset(sent));
+    let stored = bodies(&db);
+    let json_body = stored
+        .iter()
+        .find(|b| akhet::event::display_json(b)["topic"] == "plant/b/json")
+        .unwrap();
+    // The same event in format version 1 is larger by the base64 inflation.
+    let mut v1 = akhet::event::decode(json_body).unwrap();
+    if let akhet::event::EventData::MqttMessage(m) = &mut v1.data {
+        m.set_payload(&json, akhet::event::PayloadStorage::Base64);
+    }
+    let v1 = v1.encode();
+    assert!(
+        json_body.len() + json.len() / 3 - 4 <= v1.len(),
+        "{} vs {}",
+        json_body.len(),
+        v1.len()
+    );
+
+    // Single POSTs and batch-v1 both deliver the stored bytes unchanged.
+    for (sink, extra) in [("single", None), ("batch", Some("10"))] {
+        let rx_db = dir.path().join(format!("rx-{sink}.sqlite"));
+        let rx = TestReceiver::start(&rx_db);
+        let mut args = vec!["replay", "--url", &rx.url, "--sink", sink];
+        if let Some(n) = extra {
+            args.extend(["--records-per-request", n]);
+        }
+        let out = run(&db, &args, None);
+        assert!(
+            out.status.success(),
+            "{sink}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(bodies(&rx_db), stored, "{sink}");
+    }
+    // inspect shows version 2 records with their payload as base64.
+    let out = run(&db, &["inspect", "--limit", "1"], None);
+    assert!(out.status.success());
+    let line: serde_json::Value =
+        serde_json::from_slice(out.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+    assert_eq!(line["event"]["format_version"], 2);
+    assert!(line["event"]["payload_base64"].is_string());
+    assert!(run(&db, &["verify"], None).status.success());
+}
+
 /// Run the CLI collector as a separate process that aborts at `fault`.
 fn crash_collector(port: u16, client: &str, db: &Path, fault: &str, extra: &[&str]) {
     let port_s = port.to_string();

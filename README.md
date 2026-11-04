@@ -93,7 +93,7 @@ Crate layout (`src/`):
 
 | Module | Role |
 |---|---|
-| `event.rs` | Versioned event format (`format_version` 1), encoding, checksums |
+| `event.rs` | Versioned event format (`format_version` 1 and 2), encoding, checksums |
 | `spool.rs` | SQLite spool: schema versioning, append, checksummed reads, capacity, sink checkpoints, pruning |
 | `adapters/mqtt.rs` | MQTT 3.1.1 (rumqttc) with group commit and acknowledgment after commit |
 | `adapters/modbus.rs` | Modbus TCP holding-register polling (tokio-modbus) |
@@ -112,9 +112,11 @@ Replay and the receiver are synchronous. Queues are bounded (see MQTT).
 
 ### Event format
 
-Each record is one JSON object, encoded once at capture. Those exact bytes are
-checksummed (SHA-256), stored, replayed and stored by the receiver; they are
-never re-encoded. Common fields: `format_version`, `event_id` (UUIDv4,
+Each record is encoded once at capture. Those exact bytes are checksummed
+(SHA-256), stored, replayed and stored by the receiver; they are never
+re-encoded. Format version 1 (the default) is one JSON object; format version 2
+(MQTT only, see [Payload storage](#payload-storage)) is a JSON header line
+followed by the raw payload. Common fields: `format_version`, `event_id` (UUIDv4,
 generated once at capture and unchanged by retries), `collected_unix_ns`
 (collector UTC clock), `kind`, optional `source_identity`. Readers reject
 unknown `format_version` values. The format is an example contract, not a
@@ -129,6 +131,32 @@ standard base64), `payload_len`, optional `source_identity_error`.
 `subscriptions` was added within `format_version` 1: records written before it
 lack the field, and in them `subscription` is the single configured filter.
 Readers that ignore unknown fields are unaffected.
+
+#### Payload storage
+
+`mqtt --payload-storage base64|raw` (default `base64`) chooses how MQTT
+payloads are stored:
+
+- `base64`: format version 1, `payload_base64` inside the JSON object. Base64
+  adds a third to the payload; any JSON consumer can read the record.
+- `raw`: format version 2. The body is the same JSON object **without**
+  `payload_base64`, then one newline (`\n`), then exactly `payload_len` raw
+  payload bytes. Compact JSON never contains a raw newline, so the first
+  newline ends the header; the payload may contain anything. Readers check
+  that the byte count matches `payload_len` and that version 2 is used only
+  for `mqtt_message`. On the 8 × 4000-sample JSON benchmark payload the spool
+  shrinks from 8.26 to 6.21 bytes per sample (−25%, within 1% of the payload
+  itself), and both spools return the published payloads bit for bit
+  ([benchmarks](docs/benchmarks.md#spool-size-per-sample)).
+
+Both versions can share a spool, and every reader in this build (`inspect`,
+`decode`, `replay`, the receiver, the MorletDB sink) accepts both. `inspect`
+prints version 2 records with the payload re-attached as `payload_base64`, so
+its output has one shape; the stored bytes are unchanged. Compatibility:
+builds before version 2 refuse these records (unsupported `format_version`),
+so a receiver must run a build that reads version 2, or replay stops with exit
+5 (`422`). Replay sends single version 2 bodies as
+`Content-Type: application/vnd.akhet.event.v2`.
 
 Modbus (`kind: "modbus_poll"`): `endpoint`, `device_id`, `function`
 (`read_holding_registers`), `start_address` (zero-based), `count`,
@@ -664,7 +692,8 @@ What this protects, and what it does not:
 - Versioning: the file is marked with SQLite `application_id` `0x414B4854`
   and schema `user_version` 1; other files and other schema versions are
   rejected (including the old Python prototype's spool). Events carry
-  `format_version`; unsupported versions are rejected on append and on read.
+  `format_version` (1, or 2 for raw MQTT payloads; the spool schema is the
+  same for both); unsupported versions are rejected on append and on read.
 - Checksums: each stored body has a SHA-256; every read (inspect, replay,
   verify) recomputes it and fails explicitly (exit 3) on mismatch. `verify`
   also runs SQLite `quick_check`.
@@ -968,6 +997,8 @@ against `AKHET_MORLET_URL`; see the MorletDB section of the same document. `exam
 
 - The MorletDB sink handles MQTT payloads decoded by rules. Irregular Modbus
   polls are not a uniform waveform and are not written to MorletDB.
+- Payloads are stored as received (base64 or raw). Lossless sample coding at
+  the edge, e.g. with the MorletDB codec before replay, is not implemented.
 - No ML, adaptive discarding, Parquet conversion, custom storage engine,
   segment rotation, fleet management or performance claims beyond the
   measurements in docs/benchmarks.md. Deletion exists only as the explicit,

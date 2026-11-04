@@ -22,7 +22,6 @@
 //! never receives a partially decoded group.
 
 use crate::event::{Event, EventData};
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -334,7 +333,7 @@ impl DecoderConfig {
         let EventData::MqttMessage(m) = &ev.data else {
             return None;
         };
-        let payload = match base64::engine::general_purpose::STANDARD.decode(&m.payload_base64) {
+        let payload = match m.payload() {
             Ok(p) => p,
             Err(e) => {
                 return Some(Decoded {
@@ -344,7 +343,7 @@ impl DecoderConfig {
                         IssueKind::NotJson,
                         None,
                         &m.topic,
-                        format!("stored payload is not valid base64: {e}"),
+                        format!("stored payload is unreadable: {e}"),
                     )],
                 });
             }
