@@ -214,6 +214,10 @@ enum Command {
         /// Create the collection and its context tables if missing.
         #[arg(long)]
         create_collection: bool,
+        /// Do not enable MorletDB chunk summaries on the collection (they
+        /// make interval statistics over long ranges fast).
+        #[arg(long)]
+        no_chunk_summaries: bool,
         /// Do not register recordings as MorletDB acquisition channels.
         #[arg(long)]
         no_acquisitions: bool,
@@ -648,6 +652,7 @@ fn main() -> ExitCode {
             sink,
             collection,
             create_collection,
+            no_chunk_summaries,
             no_acquisitions,
             acquisition_context,
             acquisition_period_s,
@@ -679,6 +684,7 @@ fn main() -> ExitCode {
             };
             let mut cfg = akhet::morlet::MorletConfig::new(&url, &sink, &collection, decoder);
             cfg.create_collection = create_collection;
+            cfg.chunk_summaries = !no_chunk_summaries;
             cfg.acquisitions = !no_acquisitions;
             cfg.acquisition_context = acquisition_context;
             cfg.acquisition_period_s = (acquisition_period_s > 0).then_some(acquisition_period_s);

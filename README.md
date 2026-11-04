@@ -323,6 +323,18 @@ akhet --spool data/s.sqlite morlet --sink central --collection signals \
   - A gap, a new recording or the size limit starts a new chunk.
   - Committed records are never sent again, so different chunk boundaries
     between runs cannot conflict.
+- **Chunk summaries:** on by default (pg_morlet 0.3.4-alpha.1 or later).
+  MorletDB then stores count, min, max and sums with every chunk, so
+  `morlet_interval_stats` and `morlet_interval_overview` over hours or days
+  read summaries instead of decoding the samples. The results are bitwise the
+  same; without summaries an interval is limited to 16,777,216 samples.
+  - `--create-collection` enables them (`morlet_enable_chunk_summaries`), also
+    on an existing collection. Chunks stored before then have no summary;
+    Akhet prints a note, and `morlet_build_chunk_summaries(collection,
+    recording_id)` fills them in.
+  - Without that flag, a collection without summaries gets a warning and is
+    left unchanged. An older pg_morlet without the functions also gets a
+    warning. `--no-chunk-summaries` turns all of this off.
 - **Feature extraction:** on by default, so recordings are searchable by
   features (`morlet_search_interval`, `morlet_search_streams`). With
   `--extractor auto` (the default) each new recording gets pg_morlet's
@@ -927,7 +939,8 @@ redelivered), a kill after a batch commit before its acknowledgments (whole
 batch redelivered), and batched replay killed after the remote commit or after
 the checkpoint, plus a conflict in the middle of a batch.
 
-Against MorletDB (CI runs this with the published pg_morlet image).
+Against MorletDB (CI runs this with the published pg_morlet image,
+`0.3.5-alpha.1`).
 `ci/morletdb-test.sh` starts a disposable container (loopback, test
 credentials, TLS with a throwaway CA, container name `morlet`):
 

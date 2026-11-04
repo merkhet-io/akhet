@@ -7,7 +7,7 @@
 set -euo pipefail
 dir=$1
 port=${2:-54339}
-image=${3:-ghcr.io/merkhet-io/morletdb:0.3.3-alpha.1}
+image=${3:-ghcr.io/merkhet-io/morletdb:0.3.5-alpha.1}
 mkdir -p "$dir"
 cd "$dir"
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=akhet test CA" \

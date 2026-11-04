@@ -1006,3 +1006,176 @@ fn acquisitions_can_be_turned_off() {
         .get(0);
     assert!(!exists);
 }
+
+/// `morlet_interval_stats` over the whole of every recording, by signal and
+/// batch, as (count, min, max, mean, rms) bit patterns.
+/// (count, min, max, mean, rms) with the floats as bit patterns.
+type StatBits = (i64, u64, u64, u64, u64);
+
+fn interval_stats(coll: &str) -> BTreeMap<(i64, String), StatBits> {
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    db.query(
+        &format!(
+            "SELECT ((r.metadata->'akhet'->>'anchor_unix_ns')::bigint/1000 - {T0_US})/25,
+                    r.metadata->'akhet'->>'signal', st.sample_count, st.min, st.max, st.mean, st.rms
+             FROM {coll} r,
+                  LATERAL morlet_stream_status($1::text::regclass, r.recording_id) s,
+                  LATERAL morlet_interval_stats($1::text::regclass, r.recording_id, 0, s.received_samples) st"
+        ),
+        &[&coll],
+    )
+    .unwrap()
+    .iter()
+    .map(|r| {
+        let f = |i: usize| r.get::<_, f64>(i).to_bits();
+        ((r.get(0), r.get(1)), (r.get(2), f(3), f(4), f(5), f(6)))
+    })
+    .collect()
+}
+
+fn summary_column(coll: &str) -> Option<(i64, i64)> {
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let has: bool = db
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass($1 || '_chunks') AND attname='summary' AND NOT attisdropped)",
+            &[&coll],
+        )
+        .unwrap()
+        .get(0);
+    has.then(|| {
+        let r = db
+            .query_one(
+                &format!("SELECT count(*), count(summary) FROM {coll}_chunks"),
+                &[],
+            )
+            .unwrap();
+        (r.get(0), r.get(1))
+    })
+}
+
+#[test]
+#[ignore = "needs AKHET_TEST_MORLET_URL"]
+fn chunk_summaries_give_the_statistics_of_the_raw_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("s.sqlite");
+    let want = build_spool(&spool);
+    let cfg = decoder_file(dir.path());
+
+    let coll = unique("akhet_sum");
+    assert!(
+        morlet_run(&spool, &cfg, &unique("s"), &coll, None)
+            .status
+            .success()
+    );
+    assert_exact(&coll, &want);
+    let (chunks, summarized) = summary_column(&coll).expect("summary column");
+    assert!(chunks > 0);
+    assert_eq!(summarized, chunks, "every appended chunk has a summary");
+
+    // Same spool without summaries: pg_morlet decodes every chunk instead,
+    // and the results are bitwise the same.
+    let plain = unique("akhet_nosum");
+    let out = morlet_run_args(
+        &spool,
+        &cfg,
+        &unique("s"),
+        &plain,
+        None,
+        &["--no-chunk-summaries"],
+    );
+    assert!(out.status.success());
+    assert_eq!(summary_column(&plain), None);
+    let stats = interval_stats(&coll);
+    assert_eq!(stats, interval_stats(&plain));
+
+    // Against the samples read back: count, min and max exact; mean and RMS
+    // to a few units in the last place (different summation order).
+    let samples = read_back(&coll);
+    assert_eq!(stats.len(), samples.len());
+    for (key, v) in &samples {
+        let (n, min, max, mean, rms) = stats[key];
+        let (min, max, mean, rms) = (
+            f64::from_bits(min),
+            f64::from_bits(max),
+            f64::from_bits(mean),
+            f64::from_bits(rms),
+        );
+        assert_eq!(n as usize, v.len(), "{key:?}");
+        assert_eq!(
+            min,
+            v.iter().copied().fold(f64::INFINITY, f64::min),
+            "{key:?}"
+        );
+        assert_eq!(
+            max,
+            v.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            "{key:?}"
+        );
+        let m = v.iter().sum::<f64>() / v.len() as f64;
+        let r = (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt();
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+        assert!(close(mean, m), "{key:?} mean {mean} vs {m}");
+        assert!(close(rms, r), "{key:?} rms {rms} vs {r}");
+    }
+}
+
+#[test]
+#[ignore = "needs AKHET_TEST_MORLET_URL"]
+fn chunk_summaries_are_added_to_an_existing_collection_only_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("s.sqlite");
+    build_spool(&spool);
+    let cfg = decoder_file(dir.path());
+    let coll = unique("akhet_later");
+    // One sink throughout: the later runs resume at its checkpoint.
+    let sink = unique("s");
+    let out = morlet_run_args(&spool, &cfg, &sink, &coll, None, &["--no-chunk-summaries"]);
+    assert!(out.status.success());
+    assert_eq!(summary_column(&coll), None);
+
+    // Without --create-collection: a warning, no schema change.
+    let mut args = vec![
+        "morlet",
+        "--sink",
+        &sink,
+        "--collection",
+        &coll,
+        "--config",
+        cfg.to_str().unwrap(),
+    ];
+    let mut c = akhet(&spool, &args, None);
+    c.env("AKHET_MORLET_URL", url());
+    let out = c.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("chunk summaries are not enabled"), "{err}");
+    assert!(err.contains("morlet_build_chunk_summaries"), "{err}");
+    assert_eq!(summary_column(&coll), None);
+
+    // With it: enabled, and older chunks are pointed out.
+    args.push("--create-collection");
+    let mut c = akhet(&spool, &args, None);
+    c.env("AKHET_MORLET_URL", url());
+    let out = c.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("enabled chunk summaries"), "{err}");
+    let (chunks, summarized) = summary_column(&coll).expect("summary column");
+    assert_eq!(summarized, 0, "{chunks} older chunks keep no summary");
+
+    let mut db = postgres::Client::connect(&url(), postgres::NoTls).unwrap();
+    let ids: Vec<String> = db
+        .query(&format!("SELECT recording_id FROM {coll}"), &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    for id in ids {
+        db.query_one(
+            "SELECT morlet_build_chunk_summaries($1::text::regclass, $2)",
+            &[&coll, &id],
+        )
+        .unwrap();
+    }
+    assert_eq!(summary_column(&coll), Some((chunks, chunks)));
+}
