@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
 <title id="title">Akhet mark</title>
-<desc id="desc">The hieroglyph akhet (Gardiner N27, horizon): a sun disc resting between two hills, inside a dark rounded square.</desc>
+<desc id="desc">Akhet logo: a sun disc between two hills, inside a dark rounded square.</desc>
 <rect x="1" y="1" width="126" height="126" rx="30" fill="#090c0d" stroke="#24302e" stroke-width="2"/>
 <path d="M14 90H114" stroke="#24302e" stroke-width="1.4"/>
 <path d="M18 88C18 60 28 44 42 44C54 44 61 58 64 74C67 58 74 44 86 44C100 44 110 60 110 88Z" fill="#e4e8e6"/>
