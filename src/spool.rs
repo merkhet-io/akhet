@@ -949,8 +949,7 @@ fn append_in_tx(
             max: max_event_bytes,
         });
     }
-    let event_id = event::check_body(body)?;
-    let format_version = event::EVENT_FORMAT_VERSION;
+    let (event_id, format_version) = event::check_body_version(body)?;
     let digest = event::sha256(body);
     let existing: Option<(i64, Vec<u8>)> = tx
         .prepare_cached("SELECT seq, body_sha256 FROM events WHERE event_id=?1")?

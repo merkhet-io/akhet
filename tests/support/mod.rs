@@ -154,7 +154,10 @@ pub fn bodies(db: &Path) -> Vec<Vec<u8>> {
 pub fn events(db: &Path) -> Vec<serde_json::Value> {
     bodies(db)
         .iter()
-        .map(|b| serde_json::from_slice(b).unwrap())
+        .map(|b| {
+            assert!(akhet::event::check_body(b).is_ok());
+            akhet::event::display_json(b)
+        })
         .collect()
 }
 

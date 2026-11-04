@@ -47,8 +47,9 @@ Measurements:
   the fsyncs SQLite issues), p50/p99 over all transactions of all runs. With
   group commit one transaction holds a whole batch.
 - **Spool MB/s**: final spool file size divided by the elapsed time (logical
-  database growth; MQTT payloads are stored base64-encoded inside JSON, so this
-  is about 4/3 of the payload rate). Device-level writes (rollback journal,
+  database growth; these runs store MQTT payloads base64-encoded inside JSON,
+  the default, so this is about 4/3 of the payload rate; see *Spool size per
+  sample* for raw storage). Device-level writes (rollback journal,
   metadata) were not measured.
 - `max_batch 1` is one transaction per message, i.e. the behaviour before
   group commit (same code path with a batch size of one).
@@ -96,6 +97,29 @@ CPU, 1.09 GB maximum resident set size. The memory is dominated by the
 in-memory broker, which keeps every published message of the run; it says
 nothing about the collector's own footprint, which was not measured
 separately.
+
+### Spool size per sample
+
+Run on 2026-11-04 on the same machine and setup, median of 3 runs: the daq
+shape, `max_batch 64`, 300 messages (9.6 M samples), once per payload
+storage. *spool / payload* is the spool file size divided by the published
+payload bytes. *bit-exact* means the payloads read back from the spool equal
+the published ones, byte for byte, in every run.
+
+| payload storage | event format | spool bytes | spool B/sample | spool / payload | msg/s | bit-exact |
+|---|---|---|---|---|---|---|
+| base64 | 1 | 79 310 848 | 8.26 | 1.339 | 591 | yes |
+| raw | 2 | 59 650 048 | 6.21 | 1.007 | 847 | yes |
+
+Raw storage removes the base64 third: the spool is 24.8% smaller and within
+1% of the payload. The byte counts are deterministic for this payload. The
+rates are indicative only: in the same session the daq group-commit and
+replay rows of the tables above ran 30–40% below their 2026-11-03 values (the
+machine was busier; the small-message rows matched), so compare the two rows
+with each other, not with the tables above. The payload is JSON text (about
+6.2 bytes per 16-bit sample), so even raw storage keeps about three times the
+bytes of the binary samples; coding samples losslessly before storage is out
+of scope.
 
 ## Reading the numbers
 

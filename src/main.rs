@@ -6,7 +6,22 @@ use akhet::metrics::{Metrics, MetricsServer, Mode};
 use akhet::receiver::Receiver;
 use akhet::replay::{self, ReplayConfig, ReplayError, Token};
 use akhet::spool::{self, PruneOptions, Spool, SpoolError};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PayloadStorageArg {
+    Base64,
+    Raw,
+}
+
+impl From<PayloadStorageArg> for akhet::event::PayloadStorage {
+    fn from(a: PayloadStorageArg) -> Self {
+        match a {
+            PayloadStorageArg::Base64 => Self::Base64,
+            PayloadStorageArg::Raw => Self::Raw,
+        }
+    }
+}
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -90,6 +105,12 @@ enum Command {
         keep_alive_secs: u64,
         #[arg(long, default_value_t = 256 * 1024)]
         max_payload_bytes: usize,
+        /// How payloads are stored: `base64` inside the JSON event (format
+        /// version 1) or `raw` bytes after a JSON header (format version 2,
+        /// about 25% smaller for text payloads; needs an Akhet receiver that
+        /// reads version 2).
+        #[arg(long, value_enum, default_value_t = PayloadStorageArg::Base64)]
+        payload_storage: PayloadStorageArg,
         /// In-memory queue between network and spool (messages).
         #[arg(long, default_value_t = 64)]
         queue_capacity: usize,
@@ -450,6 +471,7 @@ fn main() -> ExitCode {
             tls_client_key,
             keep_alive_secs,
             max_payload_bytes,
+            payload_storage,
             queue_capacity,
             max_batch,
             max_linger_ms,
@@ -480,6 +502,7 @@ fn main() -> ExitCode {
             }
             cfg.keep_alive = Duration::from_secs(keep_alive_secs);
             cfg.max_payload_bytes = max_payload_bytes;
+            cfg.payload_storage = payload_storage.into();
             cfg.queue_capacity = queue_capacity;
             cfg.max_batch = max_batch;
             cfg.max_linger = Duration::from_millis(max_linger_ms);
@@ -743,7 +766,7 @@ fn main() -> ExitCode {
                 after = last.seq;
                 left -= batch.len();
                 for r in batch {
-                    let ev: serde_json::Value = serde_json::from_slice(&r.body).unwrap_or_default();
+                    let ev = akhet::event::display_json(&r.body);
                     print_json(&serde_json::json!({"seq": r.seq, "event": ev}));
                 }
             }
