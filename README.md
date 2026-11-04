@@ -1,12 +1,6 @@
 <p align="center"><img src="assets/brand/readme-hero.svg" alt="Akhet — Commit first. Ack after. Durable edge collection for MQTT and Modbus TCP: a local SQLite spool and independent replay to HTTP receivers and MorletDB." width="100%"></p>
 
 <p align="center">
-<span title="Egyptian hieroglyph akhet, U+1320C">𓈌</span><br>
-<i>ꜣḫt</i>, “horizon”<br>
-<sub>Gardiner N27: the sun between two hills, the place where it rises and sets</sub>
-</p>
-
-<p align="center">
 <b>Akhet is a durable signal collector for the edge, written in Rust.</b><br>
 It takes MQTT messages and Modbus TCP registers at the machine, commits each one to a local<br>
 SQLite spool, and replays them later to an HTTP receiver or into MorletDB.
@@ -44,8 +38,7 @@ Process crashes are tested; power cuts are not yet (see
   grid, and write them into MorletDB with the controller context alongside.
 
 This is infrastructure, not a CNC application, monitoring suite or high-rate
-DAQ. The name is the Egyptian word for the horizon: the edge where things are
-first seen, before they reach the archive.
+DAQ.
 
 ## Build
 
