@@ -14,12 +14,12 @@ Type=exec
 User=akhet
 Group=akhet
 # No MQTT credentials here: replay does not need them.
-EnvironmentFile=/etc/akhet/akhet.env
+Environment=AKHET_CONFIG_FILE=/etc/akhet/akhet.toml
 StateDirectory=akhet
 StateDirectoryMode=0700
 UMask=0077
-ExecStart=/usr/local/bin/akhet --max-db-bytes ${AKHET_MAX_DB_BYTES} replay \
-    --url ${AKHET_REPLAY_URL} --sink ${AKHET_REPLAY_SINK} --follow
+# Options come from [replay] and the global keys of /etc/akhet/akhet.toml.
+ExecStart=/usr/local/bin/akhet replay
 
 # Exit codes (README): 6 = receiver unavailable after bounded retries, which
 # is worth retrying later. Do not restart on 2 (configuration), 3 (integrity or

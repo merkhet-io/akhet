@@ -116,6 +116,47 @@ akhet --spool data/spool.sqlite prune --min-age 0s
 JSON summary on stdout at exit; logs go to stderr. Ctrl-C/SIGTERM stops any
 command gracefully.
 
+### Settings file
+
+Options can also come from a TOML file (`--config-file` or
+`AKHET_CONFIG_FILE`). Keys are the long option names (`client-id` or
+`client_id`). Global options go at the top; the others go in a table per
+command, so one file can serve the collector and its replay:
+
+```toml
+spool = "/var/lib/akhet/spool.sqlite"
+max-db-bytes = 1073741824
+
+[mqtt]
+host = "broker.local"
+topic = ["plant/+/sensors", "plant/+/state"]   # repeated options are lists
+client-id = "akhet-edge-01"
+tls = true                                     # switches are true or false
+
+[replay]
+url = "https://collector.example"
+sink = "central"
+follow = true
+```
+
+```sh
+akhet --config-file akhet.toml mqtt
+akhet --config-file akhet.toml replay --limit 100   # the command line still wins
+```
+
+- **Precedence:** command line, then the option's environment variable (such
+  as `AKHET_SPOOL`), then the file, then the default. A list on the command
+  line replaces the file's list.
+- **Checked:** values go through the same parsing as on the command line. An
+  unknown key or table, a wrong shape (a list for a single value, a string
+  for a switch) or an invalid value stops with exit 2.
+- **No secrets:** passwords, tokens and the MorletDB connection string are
+  environment variables only; the file has no keys for them.
+- Tables for other commands are ignored. Relative paths are relative to the
+  working directory, as on the command line.
+  [`deploy/systemd/akhet.toml`](deploy/systemd/akhet.toml) is the example
+  used by the systemd units.
+
 ## Architecture
 
 ```text
